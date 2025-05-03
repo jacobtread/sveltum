@@ -7,9 +7,11 @@
             const nodeRequest = new Request(request.url, {
                 duplex: 'half',
                 method: request.method,
-                headers: {},
+                headers: new Headers(request.headers),
                 body: request.body ?? undefined,
             });
+
+            console.log(nodeRequest)
 
             // Pass the request onto svelte to handle
             /** @type {Response} */

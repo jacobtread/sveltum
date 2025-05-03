@@ -7,6 +7,7 @@ use deno_resolver::npm::{DenoInNpmPackageChecker, NpmResolver};
 use deno_runtime::{
     deno_core::{
         FastString, FsModuleLoader, JsBuffer, JsRuntime, ModuleSpecifier, PollEventLoopOptions,
+        ToJsBuffer,
         serde_v8::{from_v8, to_v8},
     },
     deno_fs::RealFs,
@@ -32,19 +33,19 @@ pub enum SvelteServerMessage {
     },
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct HttpRequest {
     pub url: String,
     pub method: String,
     pub headers: Vec<(String, String)>,
-    pub body: Option<JsBuffer>,
+    pub body: Option<Box<[u8]>>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct HttpResponse {
-    pub status: i32,
+    pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: JsBuffer,
+    pub body: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -175,6 +176,21 @@ struct SvelteServerRuntimeFuture {
     runtime: SvelteServerRuntime,
 }
 
+#[derive(Debug, Deserialize)]
+struct JsHttpResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: JsBuffer,
+}
+
+#[derive(Debug, Serialize)]
+struct JsHttpRequest {
+    url: String,
+    method: String,
+    headers: Vec<(String, String)>,
+    body: Option<ToJsBuffer>,
+}
+
 impl Future for SvelteServerRuntimeFuture {
     type Output = ();
 
@@ -192,10 +208,14 @@ impl Future for SvelteServerRuntimeFuture {
 
             // Convert JS value into Rust value
             let local_value: v8::Local<'_, v8::Value> = v8::Local::new(scope, &response.value);
-            let value: HttpResponse = from_v8(scope, local_value).unwrap();
+            let value: JsHttpResponse = from_v8(scope, local_value).unwrap();
 
             // Send back the response
-            _ = response.tx.send(value);
+            _ = response.tx.send(HttpResponse {
+                status: value.status,
+                headers: value.headers,
+                body: Vec::from(value.body.as_ref()),
+            });
         }
 
         // Poll the promises local set
@@ -363,7 +383,15 @@ fn invoke_handle_request(
     let global_value = global.try_cast()?;
 
     // Turn the server path into a js value
-    let request_value = to_v8(scope, request)?;
+    let request_value = to_v8(
+        scope,
+        JsHttpRequest {
+            url: request.url,
+            method: request.method,
+            headers: request.headers,
+            body: request.body.map(ToJsBuffer::from),
+        },
+    )?;
 
     let result = handle_fn
         .call(scope, global_value, &[request_value])
