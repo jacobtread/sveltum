@@ -1,12 +1,10 @@
 use std::{
-    cell::RefCell,
-    collections::VecDeque,
     future::poll_fn,
     path::{Path, PathBuf},
     pin::Pin,
     rc::Rc,
     sync::Arc,
-    task::{Poll, Waker},
+    task::Poll,
 };
 
 use anyhow::Context;
@@ -28,6 +26,8 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::LocalSet,
 };
+
+use crate::queue::WakerQueue;
 
 pub enum SvelteServerMessage {
     HttpRequest {
@@ -132,7 +132,7 @@ impl SvelteServerRuntime {
                 worker,
                 rx,
                 local_set: LocalSet::new(),
-                queue: Default::default(),
+                response_queue: Default::default(),
                 handle_fn,
             };
 
@@ -143,40 +143,6 @@ impl SvelteServerRuntime {
 
         Ok(SvelteServerHandle { tx })
     }
-}
-
-#[derive(Default, Clone)]
-struct ResponseQueue {
-    inner: Rc<RefCell<ResponseQueueInner>>,
-}
-
-impl ResponseQueue {
-    fn set_waker(&self, waker: &Waker) {
-        self.inner.borrow_mut().waker = Some(waker.clone());
-    }
-
-    fn push(&self, value: ResponseEntry) {
-        let mut inner = self.inner.borrow_mut();
-        let queue = &mut inner.queue;
-        queue.push_back(value);
-
-        // Wake up for the response
-        if let Some(waker) = inner.waker.take() {
-            waker.wake();
-        }
-    }
-
-    fn next(&self) -> Option<ResponseEntry> {
-        let mut inner = self.inner.borrow_mut();
-        let queue = &mut inner.queue;
-        queue.pop_front()
-    }
-}
-
-#[derive(Default)]
-struct ResponseQueueInner {
-    queue: VecDeque<ResponseEntry>,
-    waker: Option<Waker>,
 }
 
 struct ResponseEntry {
@@ -199,13 +165,14 @@ pub struct SvelteServerRuntime {
     local_set: LocalSet,
 
     /// Queue for responses
-    queue: ResponseQueue,
+    response_queue: WakerQueue<ResponseEntry>,
 
     /// Handler function
     handle_fn: v8::Global<v8::Value>,
 }
 
 struct SvelteServerRuntimeFuture {
+    /// Runtime itself
     runtime: SvelteServerRuntime,
 }
 
@@ -217,10 +184,10 @@ impl Future for SvelteServerRuntimeFuture {
         let runtime = &mut this.runtime;
 
         // Set the current waker
-        runtime.queue.set_waker(cx.waker());
+        runtime.response_queue.set_waker(cx.waker());
 
         // Handle waiting messages
-        while let Some(response) = runtime.queue.next() {
+        while let Some(response) = runtime.response_queue.next() {
             // Get the handle scope
             let scope = &mut runtime.worker.handle_scope();
 
@@ -253,7 +220,7 @@ impl Future for SvelteServerRuntimeFuture {
                         invoke_handle_request(&mut runtime.worker, &runtime.handle_fn, request)
                             .unwrap();
                     let resolve = runtime.worker.resolve(global_promise);
-                    let res_queue = runtime.queue.clone();
+                    let res_queue = runtime.response_queue.clone();
                     runtime.local_set.spawn_local(async move {
                         let value = resolve.await.unwrap();
                         res_queue.push(ResponseEntry { value, tx });

@@ -1,7 +1,11 @@
 
-
 (() => {
 
+    /**
+     * 
+     * @param {*} server 
+     * @returns 
+     */
     function createRequestHandler(server) {
         return async (request) => {
             // Translate the Rust request data into a node request

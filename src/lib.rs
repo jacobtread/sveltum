@@ -1,10 +1,11 @@
-use runtime::{HttpRequest, SvelteServerRuntime};
-use std::{path::Path, time::Duration};
+pub mod queue;
+pub mod runtime;
 
-mod runtime;
-
-#[tokio::main]
+#[tokio::test]
 async fn main() {
+    use runtime::{HttpRequest, SvelteServerRuntime};
+    use std::{path::Path, time::Duration};
+
     let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("build");
     let handle = SvelteServerRuntime::create(server_path).unwrap();
 
