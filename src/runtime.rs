@@ -1,10 +1,12 @@
 use std::{
+    cell::RefCell,
+    collections::VecDeque,
     future::poll_fn,
     path::{Path, PathBuf},
     pin::Pin,
     rc::Rc,
     sync::Arc,
-    task::Poll,
+    task::{Poll, Waker},
 };
 
 use anyhow::Context;
@@ -50,6 +52,16 @@ pub struct SvelteServerHandle {
 }
 
 impl SvelteServerHandle {}
+
+#[derive(Clone)]
+pub struct ResponseQueue {
+    inner: Rc<RefCell<ResponseQueueInner>>,
+}
+
+struct ResponseQueueInner {
+    queue: VecDeque<v8::Global<v8::Value>>,
+    waker: Option<Waker>,
+}
 
 /// Wrapper around a deno runtime worker that has loaded a svelte
 /// server and can perform svelte requests
@@ -143,21 +155,32 @@ impl SvelteServerRuntime {
 
         println!("created server object");
 
-        let responses = Rc::new(Mutex::new(Vec::new()));
+        let res_queue = ResponseQueue {
+            inner: Rc::new(RefCell::new(ResponseQueueInner {
+                queue: VecDeque::new(),
+                waker: None,
+            })),
+        };
 
         poll_fn(move |cx| {
+            // Set the current waker
+            {
+                res_queue.inner.borrow_mut().waker = Some(cx.waker().clone());
+            }
+
             let this = &mut self;
 
+            // Handle waiting messages
             {
-                if let Ok(mut lock) = responses.try_lock() {
-                    if let Some(response) = lock.pop() {
-                        // Get the handle scope
-                        let scope = &mut this.worker.js_runtime.handle_scope();
-                        let local_value: v8::Local<'_, v8::Value> =
-                            v8::Local::new(scope, &response);
-                        let value: HttpResponse = from_v8(scope, local_value).unwrap();
-                        println!("Got response {value:?}");
-                    }
+                let mut inner = res_queue.inner.borrow_mut();
+                let queue = &mut inner.queue;
+
+                while let Some(response) = queue.pop_front() {
+                    // Get the handle scope
+                    let scope = &mut this.worker.js_runtime.handle_scope();
+                    let local_value: v8::Local<'_, v8::Value> = v8::Local::new(scope, &response);
+                    let value: HttpResponse = from_v8(scope, local_value).unwrap();
+                    println!("Got response {value:?}");
                 }
             }
 
@@ -186,10 +209,12 @@ impl SvelteServerRuntime {
                             invoke_handle_request(&mut this.worker.js_runtime, &handle_fn, request)
                                 .unwrap();
                         let resolve = this.worker.js_runtime.resolve(global_promise);
-                        let res = responses.clone();
+                        let res_queue = res_queue.clone();
                         this.local_set.spawn_local(async move {
                             let result = resolve.await.unwrap();
-                            res.lock().await.push(result);
+                            let mut inner = res_queue.inner.borrow_mut();
+                            let queue = &mut inner.queue;
+                            queue.push_back(result);
                         });
                         println!("spawned a promise task");
                     }
