@@ -25,18 +25,25 @@ use deno_runtime::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{mpsc, oneshot},
     task::LocalSet,
 };
 
 pub enum SvelteServerMessage {
-    HttpRequest { request: HttpRequest },
+    HttpRequest {
+        // Request itself
+        request: HttpRequest,
+        // Channel for the response
+        tx: oneshot::Sender<HttpResponse>,
+    },
 }
 
 #[derive(Serialize)]
 pub struct HttpRequest {
     pub url: String,
     pub method: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<JsBuffer>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,35 +55,18 @@ pub struct HttpResponse {
 
 #[derive(Clone)]
 pub struct SvelteServerHandle {
-    pub tx: mpsc::Sender<SvelteServerMessage>,
+    tx: mpsc::Sender<SvelteServerMessage>,
 }
 
-impl SvelteServerHandle {}
-
-#[derive(Clone)]
-pub struct ResponseQueue {
-    inner: Rc<RefCell<ResponseQueueInner>>,
-}
-
-struct ResponseQueueInner {
-    queue: VecDeque<v8::Global<v8::Value>>,
-    waker: Option<Waker>,
-}
-
-/// Wrapper around a deno runtime worker that has loaded a svelte
-/// server and can perform svelte requests
-pub struct SvelteServerRuntime {
-    /// Underlying deno runtime worker
-    worker: MainWorker,
-
-    /// Path to the underlying server
-    server_path: PathBuf,
-
-    /// Receiver for handle messages
-    rx: mpsc::Receiver<SvelteServerMessage>,
-
-    /// Local set for spawned promise tasks
-    local_set: LocalSet,
+impl SvelteServerHandle {
+    pub async fn request(&self, request: HttpRequest) -> anyhow::Result<HttpResponse> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(SvelteServerMessage::HttpRequest { request, tx })
+            .await?;
+        let result = rx.await?;
+        Ok(result)
+    }
 }
 
 impl SvelteServerRuntime {
@@ -125,119 +115,162 @@ impl SvelteServerRuntime {
                 },
             );
 
+            // We only need the js runtime from the worker
+            let mut worker = worker.js_runtime;
+
+            let bootstrap_fn = create_bootstrap(&mut worker).unwrap();
+            let server_object_promise =
+                create_server_object(&mut worker, bootstrap_fn, server_path.clone()).unwrap();
+
+            let handle_fn = runtime
+                .block_on(resolve_promise(&mut worker, server_object_promise))
+                .unwrap();
+
+            println!("created server object");
+
             let server_runtime = Self {
                 worker,
                 rx,
-                server_path,
                 local_set: LocalSet::new(),
+                queue: Default::default(),
+                handle_fn,
             };
 
-            runtime.block_on(server_runtime.run());
+            runtime.block_on(SvelteServerRuntimeFuture {
+                runtime: server_runtime,
+            });
         });
 
         Ok(SvelteServerHandle { tx })
     }
+}
 
-    pub async fn run(mut self) {
-        let bootstrap_fn = create_bootstrap(&mut self.worker.js_runtime).unwrap();
-        println!("initialized bootstrap");
-        let server_object_promise = create_server_object(
-            &mut self.worker.js_runtime,
-            bootstrap_fn,
-            self.server_path.clone(),
-        )
-        .unwrap();
-        println!("created server object promise");
+#[derive(Default, Clone)]
+struct ResponseQueue {
+    inner: Rc<RefCell<ResponseQueueInner>>,
+}
 
-        let handle_fn = resolve_promise(&mut self.worker.js_runtime, server_object_promise)
-            .await
-            .unwrap();
+impl ResponseQueue {
+    fn set_waker(&self, waker: &Waker) {
+        self.inner.borrow_mut().waker = Some(waker.clone());
+    }
 
-        println!("created server object");
+    fn push(&self, value: ResponseEntry) {
+        let mut inner = self.inner.borrow_mut();
+        let queue = &mut inner.queue;
+        queue.push_back(value);
 
-        let res_queue = ResponseQueue {
-            inner: Rc::new(RefCell::new(ResponseQueueInner {
-                queue: VecDeque::new(),
-                waker: None,
-            })),
-        };
+        // Wake up for the response
+        if let Some(waker) = inner.waker.take() {
+            waker.wake();
+        }
+    }
 
-        poll_fn(move |cx| {
-            // Set the current waker
-            {
-                res_queue.inner.borrow_mut().waker = Some(cx.waker().clone());
-            }
+    fn next(&self) -> Option<ResponseEntry> {
+        let mut inner = self.inner.borrow_mut();
+        let queue = &mut inner.queue;
+        queue.pop_front()
+    }
+}
 
-            let this = &mut self;
+#[derive(Default)]
+struct ResponseQueueInner {
+    queue: VecDeque<ResponseEntry>,
+    waker: Option<Waker>,
+}
 
-            // Handle waiting messages
-            {
-                let mut inner = res_queue.inner.borrow_mut();
-                let queue = &mut inner.queue;
+struct ResponseEntry {
+    // Response value from JS
+    value: v8::Global<v8::Value>,
+    // Sender for the parsed response
+    tx: oneshot::Sender<HttpResponse>,
+}
 
-                while let Some(response) = queue.pop_front() {
-                    // Get the handle scope
-                    let scope = &mut this.worker.js_runtime.handle_scope();
-                    let local_value: v8::Local<'_, v8::Value> = v8::Local::new(scope, &response);
-                    let value: HttpResponse = from_v8(scope, local_value).unwrap();
-                    println!("Got response {value:?}");
+/// Wrapper around a deno runtime worker that has loaded a svelte
+/// server and can perform svelte requests
+pub struct SvelteServerRuntime {
+    /// Underlying deno runtime worker
+    worker: JsRuntime,
+
+    /// Receiver for handle messages
+    rx: mpsc::Receiver<SvelteServerMessage>,
+
+    /// Local set for spawned promise tasks
+    local_set: LocalSet,
+
+    /// Queue for responses
+    queue: ResponseQueue,
+
+    /// Handler function
+    handle_fn: v8::Global<v8::Value>,
+}
+
+struct SvelteServerRuntimeFuture {
+    runtime: SvelteServerRuntime,
+}
+
+impl Future for SvelteServerRuntimeFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let runtime = &mut this.runtime;
+
+        // Set the current waker
+        runtime.queue.set_waker(cx.waker());
+
+        // Handle waiting messages
+        while let Some(response) = runtime.queue.next() {
+            // Get the handle scope
+            let scope = &mut runtime.worker.handle_scope();
+
+            // Convert JS value into Rust value
+            let local_value: v8::Local<'_, v8::Value> = v8::Local::new(scope, &response.value);
+            let value: HttpResponse = from_v8(scope, local_value).unwrap();
+
+            // Send back the response
+            _ = response.tx.send(value);
+        }
+
+        // Poll the promises local set
+        _ = Pin::new(&mut runtime.local_set).poll(cx);
+
+        // Poll the event loop
+        let _ = runtime
+            .worker
+            .poll_event_loop(cx, PollEventLoopOptions::default());
+
+        // Poll incoming script execute messages
+        while let Poll::Ready(msg) = runtime.rx.poll_recv(cx) {
+            let msg = match msg {
+                Some(msg) => msg,
+                None => return Poll::Ready(()),
+            };
+
+            match msg {
+                SvelteServerMessage::HttpRequest { request, tx } => {
+                    let global_promise =
+                        invoke_handle_request(&mut runtime.worker, &runtime.handle_fn, request)
+                            .unwrap();
+                    let resolve = runtime.worker.resolve(global_promise);
+                    let res_queue = runtime.queue.clone();
+                    runtime.local_set.spawn_local(async move {
+                        let value = resolve.await.unwrap();
+                        res_queue.push(ResponseEntry { value, tx });
+                    });
                 }
             }
 
-            // Initial pass when not messages are available
-            {
-                // Poll the promises local set
-                _ = Pin::new(&mut this.local_set).poll(cx);
+            // Poll the promises local set
+            _ = Pin::new(&mut runtime.local_set).poll(cx);
 
-                // Poll event loop for any promises
-                let _ = this
-                    .worker
-                    .js_runtime
-                    .poll_event_loop(cx, PollEventLoopOptions::default());
-            }
+            // Poll the event loop
+            let _ = runtime
+                .worker
+                .poll_event_loop(cx, PollEventLoopOptions::default());
+        }
 
-            // Poll incoming script execute messages
-            while let Poll::Ready(msg) = this.rx.poll_recv(cx) {
-                let msg = match msg {
-                    Some(msg) => msg,
-                    None => return Poll::Ready(()),
-                };
-
-                match msg {
-                    SvelteServerMessage::HttpRequest { request } => {
-                        let global_promise =
-                            invoke_handle_request(&mut this.worker.js_runtime, &handle_fn, request)
-                                .unwrap();
-                        let resolve = this.worker.js_runtime.resolve(global_promise);
-                        let res_queue = res_queue.clone();
-                        this.local_set.spawn_local(async move {
-                            let result = resolve.await.unwrap();
-                            let mut inner = res_queue.inner.borrow_mut();
-                            let queue = &mut inner.queue;
-                            queue.push_back(result);
-
-                            // Wake up for the response
-                            if let Some(waker) = inner.waker.take() {
-                                waker.wake();
-                            }
-                        });
-                        println!("spawned a promise task");
-                    }
-                }
-
-                // Poll the promises local set
-                _ = Pin::new(&mut this.local_set).poll(cx);
-
-                // Poll the event loop
-                let _ = this
-                    .worker
-                    .js_runtime
-                    .poll_event_loop(cx, PollEventLoopOptions::default());
-            }
-
-            Poll::Pending
-        })
-        .await;
+        Poll::Pending
     }
 }
 

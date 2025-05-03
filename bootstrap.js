@@ -9,7 +9,7 @@
                 duplex: 'half',
                 method: request.method,
                 headers: {},
-                body: undefined,
+                body: request.body ?? undefined,
             });
 
             // Pass the request onto svelte to handle
@@ -59,9 +59,6 @@
             throw err;
         }
     }
-
-    console.log("[JS] create server created");
-
 
     return createServer
 })()

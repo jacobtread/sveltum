@@ -1,4 +1,4 @@
-use runtime::{HttpRequest, SvelteServerMessage, SvelteServerRuntime};
+use runtime::{HttpRequest, SvelteServerRuntime};
 use std::{path::Path, time::Duration};
 
 mod runtime;
@@ -9,16 +9,17 @@ async fn main() {
     let handle = SvelteServerRuntime::create(server_path).unwrap();
 
     loop {
-        handle
-            .tx
-            .send(SvelteServerMessage::HttpRequest {
-                request: HttpRequest {
-                    method: "GET".to_string(),
-                    url: "http://localhost:5173/sverdle".to_string(),
-                },
+        let response = handle
+            .request(HttpRequest {
+                method: "GET".to_string(),
+                headers: Vec::new(),
+                url: "http://localhost:5173/sverdle".to_string(),
+                body: None,
             })
             .await
             .unwrap();
+
+        println!("response: {response:?}");
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
