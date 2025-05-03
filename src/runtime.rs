@@ -1,10 +1,5 @@
 use std::{
-    future::poll_fn,
-    path::{Path, PathBuf},
-    pin::Pin,
-    rc::Rc,
-    sync::Arc,
-    task::Poll,
+    collections::HashSet, future::poll_fn, path::PathBuf, pin::Pin, rc::Rc, sync::Arc, task::Poll,
 };
 
 use anyhow::Context;
@@ -12,7 +7,6 @@ use deno_resolver::npm::{DenoInNpmPackageChecker, NpmResolver};
 use deno_runtime::{
     deno_core::{
         FastString, FsModuleLoader, JsBuffer, JsRuntime, ModuleSpecifier, PollEventLoopOptions,
-        futures::FutureExt,
         serde_v8::{from_v8, to_v8},
     },
     deno_fs::RealFs,
@@ -69,6 +63,45 @@ impl SvelteServerHandle {
     }
 }
 
+pub fn create_js_worker() -> JsRuntime {
+    let permissions = PermissionsContainer::allow_all(Arc::new(
+        RuntimePermissionDescriptorParser::new(sys_traits::impls::RealSys),
+    ));
+
+    let worker = MainWorker::bootstrap_from_options(
+        // We do not have a "real" main module so this is just a placeholder (We don't use it)
+        &ModuleSpecifier::parse("file://dev/null").expect("failed to create file path url"),
+        // Configuration
+        WorkerServiceOptions::<
+            DenoInNpmPackageChecker,
+            NpmResolver<sys_traits::impls::RealSys>,
+            sys_traits::impls::RealSys,
+        > {
+            blob_store: Default::default(),
+            broadcast_channel: Default::default(),
+            deno_rt_native_addon_loader: None,
+            feature_checker: Default::default(),
+            fs: Arc::new(RealFs),
+            module_loader: Rc::new(FsModuleLoader),
+            node_services: Default::default(),
+            npm_process_state_provider: Default::default(),
+            permissions,
+            root_cert_store_provider: Default::default(),
+            fetch_dns_resolver: Default::default(),
+            shared_array_buffer_store: Default::default(),
+            compiled_wasm_module_store: Default::default(),
+            v8_code_cache: Default::default(),
+        },
+        WorkerOptions {
+            extensions: vec![],
+            ..Default::default()
+        },
+    );
+
+    // We only need the js runtime from the worker
+    worker.js_runtime
+}
+
 impl SvelteServerRuntime {
     pub fn create(server_path: PathBuf) -> anyhow::Result<SvelteServerHandle> {
         let (tx, rx) = mpsc::channel(10);
@@ -80,51 +113,17 @@ impl SvelteServerRuntime {
                 .build()
                 .expect("failed to create script async runtime");
 
-            // Setup the main module file
-            let js_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap.js");
-            let main_module = ModuleSpecifier::from_file_path(js_path).unwrap();
-            let permissions = PermissionsContainer::allow_all(Arc::new(
-                RuntimePermissionDescriptorParser::new(sys_traits::impls::RealSys),
-            ));
-
-            let worker = MainWorker::bootstrap_from_options(
-                &main_module,
-                WorkerServiceOptions::<
-                    DenoInNpmPackageChecker,
-                    NpmResolver<sys_traits::impls::RealSys>,
-                    sys_traits::impls::RealSys,
-                > {
-                    blob_store: Default::default(),
-                    broadcast_channel: Default::default(),
-                    deno_rt_native_addon_loader: None,
-                    feature_checker: Default::default(),
-                    fs: Arc::new(RealFs),
-                    module_loader: Rc::new(FsModuleLoader),
-                    node_services: Default::default(),
-                    npm_process_state_provider: Default::default(),
-                    permissions,
-                    root_cert_store_provider: Default::default(),
-                    fetch_dns_resolver: Default::default(),
-                    shared_array_buffer_store: Default::default(),
-                    compiled_wasm_module_store: Default::default(),
-                    v8_code_cache: Default::default(),
-                },
-                WorkerOptions {
-                    extensions: vec![],
-                    ..Default::default()
-                },
-            );
-
-            // We only need the js runtime from the worker
-            let mut worker = worker.js_runtime;
+            let mut worker = create_js_worker();
 
             let bootstrap_fn = create_bootstrap(&mut worker).unwrap();
             let server_object_promise =
                 create_server_object(&mut worker, bootstrap_fn, server_path.clone()).unwrap();
 
-            let handle_fn = runtime
+            let server_object = runtime
                 .block_on(resolve_promise(&mut worker, server_object_promise))
                 .unwrap();
+
+            let server_object = parse_server_object(&mut worker, server_object).unwrap();
 
             println!("created server object");
 
@@ -133,7 +132,7 @@ impl SvelteServerRuntime {
                 rx,
                 local_set: LocalSet::new(),
                 response_queue: Default::default(),
-                handle_fn,
+                server_object,
             };
 
             runtime.block_on(SvelteServerRuntimeFuture {
@@ -167,8 +166,8 @@ pub struct SvelteServerRuntime {
     /// Queue for responses
     response_queue: WakerQueue<ResponseEntry>,
 
-    /// Handler function
-    handle_fn: v8::Global<v8::Value>,
+    /// Server handling object
+    server_object: ServerObject,
 }
 
 struct SvelteServerRuntimeFuture {
@@ -216,9 +215,12 @@ impl Future for SvelteServerRuntimeFuture {
 
             match msg {
                 SvelteServerMessage::HttpRequest { request, tx } => {
-                    let global_promise =
-                        invoke_handle_request(&mut runtime.worker, &runtime.handle_fn, request)
-                            .unwrap();
+                    let global_promise = invoke_handle_request(
+                        &mut runtime.worker,
+                        &runtime.server_object.handler,
+                        request,
+                    )
+                    .unwrap();
                     let resolve = runtime.worker.resolve(global_promise);
                     let res_queue = runtime.response_queue.clone();
                     runtime.local_set.spawn_local(async move {
@@ -247,16 +249,15 @@ fn create_bootstrap(runtime: &mut JsRuntime) -> anyhow::Result<v8::Global<v8::Va
     Ok(output)
 }
 
-/// Resolve a `promise` on the js runtime while polling the runtime itself
-async fn resolve_promise(
-    runtime: &mut JsRuntime,
-    promise: v8::Global<v8::Value>,
-) -> anyhow::Result<v8::Global<v8::Value>> {
-    let mut resolve_future = runtime.resolve(promise);
+async fn poll_with_event_loop<F>(runtime: &mut JsRuntime, mut future: F) -> F::Output
+where
+    F: Future + Unpin,
+{
+    let mut future = Pin::new(&mut future);
 
     poll_fn(move |cx| {
-        if let Poll::Ready(result) = resolve_future.poll_unpin(cx) {
-            return Poll::Ready(result.map_err(anyhow::Error::new));
+        if let Poll::Ready(result) = future.as_mut().poll(cx) {
+            return Poll::Ready(result);
         }
 
         // Poll the event loop
@@ -264,6 +265,54 @@ async fn resolve_promise(
         Poll::Pending
     })
     .await
+}
+
+/// Resolve a `promise` on the js runtime while polling the runtime itself
+async fn resolve_promise(
+    runtime: &mut JsRuntime,
+    promise: v8::Global<v8::Value>,
+) -> anyhow::Result<v8::Global<v8::Value>> {
+    let resolve_future = runtime.resolve(promise);
+    poll_with_event_loop(runtime, resolve_future)
+        .await
+        .map_err(anyhow::Error::new)
+}
+
+pub struct ServerObject {
+    pub handler: v8::Global<v8::Value>,
+    pub prerendered: HashSet<String>,
+}
+
+fn parse_server_object(
+    runtime: &mut JsRuntime,
+    server_object: v8::Global<v8::Value>,
+) -> anyhow::Result<ServerObject> {
+    // Get the handle scope
+    let scope = &mut runtime.handle_scope();
+
+    let server_object = v8::Local::new(scope, server_object);
+    let server_object = server_object.try_cast::<v8::Object>()?;
+
+    let handler_key = v8::String::new(scope, "handler")
+        .context("failed to make handler key")?
+        .try_cast()?;
+    let handler = server_object
+        .get(scope, handler_key)
+        .context("failed to get handler")?;
+
+    let prerendered_key = v8::String::new(scope, "prerendered")
+        .context("failed to make prerendered key")?
+        .try_cast()?;
+    let prerendered = server_object
+        .get(scope, prerendered_key)
+        .context("failed to get prerendered")?;
+
+    let prerendered: Vec<String> = from_v8(scope, prerendered)?;
+
+    Ok(ServerObject {
+        handler: Global::new(scope, handler),
+        prerendered: prerendered.into_iter().collect(),
+    })
 }
 
 /// Creates and initializes new svelte server object
@@ -288,11 +337,11 @@ fn create_server_object(
     // Turn the server path into a js value
     let path_value = to_v8(scope, server_path)?;
 
-    let result = create_server_fn
+    let output = create_server_fn
         .call(scope, global_value, &[path_value])
         .context("function provided no return value")?;
 
-    Ok(Global::new(scope, result))
+    Ok(Global::new(scope, output))
 }
 
 /// Creates and initializes new svelte server object

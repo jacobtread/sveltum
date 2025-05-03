@@ -1,11 +1,6 @@
 
 (() => {
 
-    /**
-     * 
-     * @param {*} server 
-     * @returns 
-     */
     function createRequestHandler(server) {
         return async (request) => {
             // Translate the Rust request data into a node request
@@ -39,6 +34,8 @@
     async function createServer(path) {
         try {
             const pathLib = await import("node:path");
+            const { createReadStream } = await import("node:fs");
+            const { Readable } = await import("node:stream");
 
             // Load the server itself
             const { Server } = await import(`file://${path}/server/index.js`)
@@ -54,10 +51,13 @@
             // Initialize the server
             await server.init({
                 env: process.env,
-                read: (file) => createReadableStream(`${asset_dir}/${file}`)
+                read: (file) => Readable.toWeb(createReadStream(`${asset_dir}/${file}`))
             });
 
-            return createRequestHandler(server);
+            return {
+                handler: createRequestHandler(server),
+                prerendered: Array.from(prerendered)
+            };
         } catch (err) {
             console.error(err);
             throw err;
