@@ -1,0 +1,13 @@
+[package]
+name = "sveltum"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+axum-core = "0.5.2"
+deno_resolver = "0.35.0"
+deno_runtime = { version = "0.212.0", features = ["transpile"] }
+serde = { version = "1.0.219", features = ["derive"] }
+sys_traits = "0.1.9"
+tokio = { version = "1.44.2", features = ["full"] }
