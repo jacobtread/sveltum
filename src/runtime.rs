@@ -215,6 +215,11 @@ impl SvelteServerRuntime {
                             let mut inner = res_queue.inner.borrow_mut();
                             let queue = &mut inner.queue;
                             queue.push_back(result);
+
+                            // Wake up for the response
+                            if let Some(waker) = inner.waker.take() {
+                                waker.wake();
+                            }
                         });
                         println!("spawned a promise task");
                     }
