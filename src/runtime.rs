@@ -19,7 +19,7 @@ use deno_runtime::{
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{mpsc, oneshot},
-    task::LocalSet,
+    task::{LocalSet, spawn_local},
 };
 
 use crate::queue::WakerQueue;
@@ -122,6 +122,8 @@ impl SvelteServerRuntime {
                 .build()
                 .expect("failed to create script async runtime");
 
+            let local_set = LocalSet::new();
+
             let mut worker = create_js_worker();
 
             let bootstrap_fn = create_bootstrap(&mut worker).unwrap();
@@ -139,7 +141,6 @@ impl SvelteServerRuntime {
             let server_runtime = Self {
                 worker,
                 rx: handle_rx,
-                local_set: LocalSet::new(),
                 response_queue: Default::default(),
                 handler: server_object.handler,
             };
@@ -152,9 +153,11 @@ impl SvelteServerRuntime {
                 return;
             }
 
-            runtime.block_on(SvelteServerRuntimeFuture {
+            local_set.spawn_local(SvelteServerRuntimeFuture {
                 runtime: server_runtime,
             });
+
+            runtime.block_on(local_set)
         });
 
         let response = init_rx.await?;
@@ -179,9 +182,6 @@ pub struct SvelteServerRuntime {
 
     /// Receiver for handle messages
     rx: mpsc::Receiver<SvelteServerMessage>,
-
-    /// Local set for spawned promise tasks
-    local_set: LocalSet,
 
     /// Queue for responses
     response_queue: WakerQueue<ResponseEntry>,
@@ -242,9 +242,6 @@ impl Future for SvelteServerRuntimeFuture {
             });
         }
 
-        // Poll the promises local set
-        _ = Pin::new(&mut runtime.local_set).poll(cx);
-
         // Poll the event loop
         let _ = runtime
             .worker
@@ -264,15 +261,12 @@ impl Future for SvelteServerRuntimeFuture {
                             .unwrap();
                     let resolve = runtime.worker.resolve(global_promise);
                     let res_queue = runtime.response_queue.clone();
-                    runtime.local_set.spawn_local(async move {
+                    spawn_local(async move {
                         let value = resolve.await.unwrap();
                         res_queue.push(ResponseEntry { value, tx });
                     });
                 }
             }
-
-            // Poll the promises local set
-            _ = Pin::new(&mut runtime.local_set).poll(cx);
 
             // Poll the event loop
             let _ = runtime
