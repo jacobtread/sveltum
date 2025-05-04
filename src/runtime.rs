@@ -29,10 +29,6 @@ pub struct InitializedResponse {
 }
 
 pub enum SvelteServerMessage {
-    Initialize {
-        tx: oneshot::Sender<InitializedResponse>,
-    },
-
     HttpRequest {
         // Request itself
         request: HttpRequest,
@@ -62,13 +58,6 @@ pub struct SvelteServerHandle {
 }
 
 impl SvelteServerHandle {
-    pub(crate) async fn initialize(&self) -> anyhow::Result<InitializedResponse> {
-        let (tx, rx) = oneshot::channel();
-        self.tx.send(SvelteServerMessage::Initialize { tx }).await?;
-        let result = rx.await?;
-        Ok(result)
-    }
-
     pub async fn request(&self, request: HttpRequest) -> anyhow::Result<HttpResponse> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -119,8 +108,11 @@ pub fn create_js_worker() -> JsRuntime {
 }
 
 impl SvelteServerRuntime {
-    pub fn create(server_path: PathBuf) -> anyhow::Result<SvelteServerHandle> {
-        let (tx, rx) = mpsc::channel(10);
+    pub async fn create(
+        server_path: PathBuf,
+    ) -> anyhow::Result<(InitializedResponse, SvelteServerHandle)> {
+        let (handle_tx, handle_rx) = mpsc::channel(10);
+        let (init_tx, init_rx) = oneshot::channel();
 
         std::thread::spawn(move || {
             // Create a new tokio runtime in the dedicated thread
@@ -145,18 +137,28 @@ impl SvelteServerRuntime {
 
             let server_runtime = Self {
                 worker,
-                rx,
+                rx: handle_rx,
                 local_set: LocalSet::new(),
                 response_queue: Default::default(),
                 server_object,
             };
+
+            if let Err(cause) = init_tx.send(InitializedResponse {
+                prerendered: server_runtime.server_object.prerendered.clone(),
+            }) {
+                // Creator of the handle dropped the future already, don't keep going
+                return;
+            }
 
             runtime.block_on(SvelteServerRuntimeFuture {
                 runtime: server_runtime,
             });
         });
 
-        Ok(SvelteServerHandle { tx })
+        let response = init_rx.await?;
+        let handle = SvelteServerHandle { tx: handle_tx };
+
+        Ok((response, handle))
     }
 }
 
@@ -262,11 +264,6 @@ impl Future for SvelteServerRuntimeFuture {
                         let value = resolve.await.unwrap();
                         res_queue.push(ResponseEntry { value, tx });
                     });
-                }
-                SvelteServerMessage::Initialize { tx } => {
-                    _ = tx.send(InitializedResponse {
-                        prerendered: runtime.server_object.prerendered.clone(),
-                    })
                 }
             }
 

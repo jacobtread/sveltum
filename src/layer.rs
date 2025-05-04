@@ -36,8 +36,7 @@ pub struct ServeSvelteConfig {
 
 impl ServeSvelte {
     pub async fn create(config: ServeSvelteConfig) -> anyhow::Result<ServeSvelte> {
-        let handle = SvelteServerRuntime::create(config.server_path.clone())?;
-        let response = handle.initialize().await?;
+        let (response, handle) = SvelteServerRuntime::create(config.server_path.clone()).await?;
 
         Ok(Self {
             handle,
