@@ -24,7 +24,15 @@ use tokio::{
 
 use crate::queue::WakerQueue;
 
+pub struct InitializedResponse {
+    pub prerendered: HashSet<String>,
+}
+
 pub enum SvelteServerMessage {
+    Initialize {
+        tx: oneshot::Sender<InitializedResponse>,
+    },
+
     HttpRequest {
         // Request itself
         request: HttpRequest,
@@ -54,6 +62,13 @@ pub struct SvelteServerHandle {
 }
 
 impl SvelteServerHandle {
+    pub(crate) async fn initialize(&self) -> anyhow::Result<InitializedResponse> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(SvelteServerMessage::Initialize { tx }).await?;
+        let result = rx.await?;
+        Ok(result)
+    }
+
     pub async fn request(&self, request: HttpRequest) -> anyhow::Result<HttpResponse> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -247,6 +262,11 @@ impl Future for SvelteServerRuntimeFuture {
                         let value = resolve.await.unwrap();
                         res_queue.push(ResponseEntry { value, tx });
                     });
+                }
+                SvelteServerMessage::Initialize { tx } => {
+                    _ = tx.send(InitializedResponse {
+                        prerendered: runtime.server_object.prerendered.clone(),
+                    })
                 }
             }
 

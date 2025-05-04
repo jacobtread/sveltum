@@ -58,6 +58,9 @@
 
             return {
                 handler: createRequestHandler(server),
+                manifest: {
+                    appPath: manifest.appPath,
+                },
                 prerendered: Array.from(prerendered)
             };
         } catch (err) {

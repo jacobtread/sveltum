@@ -1,13 +1,18 @@
 use std::{
+    collections::HashSet,
     convert::Infallible,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
     task::{Context, Poll},
 };
 
 use axum_core::body::Body;
 use deno_runtime::deno_core::futures::future::BoxFuture;
-use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, header::CONTENT_TYPE};
+use http::{
+    HeaderName, HeaderValue, Method, Request, Response, StatusCode,
+    header::{self, CONTENT_TYPE},
+};
 use http_body_util::BodyExt;
 use tower_service::Service;
 
@@ -16,18 +21,43 @@ use crate::runtime::{HttpRequest, SvelteServerHandle, SvelteServerRuntime};
 #[derive(Clone)]
 pub struct ServeSvelte {
     handle: SvelteServerHandle,
-    server_path: PathBuf,
+    config: Arc<ServeSvelteConfig>,
+    state: Arc<ServeSvelteState>,
+}
+
+struct ServeSvelteState {
+    prerendered: HashSet<String>,
+}
+
+pub struct ServeSvelteConfig {
+    pub server_path: PathBuf,
+    pub origin: Option<String>,
 }
 
 impl ServeSvelte {
-    pub fn create(server_path: PathBuf) -> anyhow::Result<ServeSvelte> {
-        let handle = SvelteServerRuntime::create(server_path.clone())?;
+    pub async fn create(config: ServeSvelteConfig) -> anyhow::Result<ServeSvelte> {
+        let handle = SvelteServerRuntime::create(config.server_path.clone())?;
+        let response = handle.initialize().await?;
+
         Ok(Self {
             handle,
-            server_path,
+            state: Arc::new(ServeSvelteState {
+                prerendered: response.prerendered,
+            }),
+            config: Arc::new(config),
         })
     }
 }
+
+pub fn get_request_origin(req: &Request<Body>) -> Option<&str> {
+    let origin = req.headers().get(header::ORIGIN)?;
+    origin.to_str().ok()
+}
+
+/// Serve something statically
+pub async fn static_serve(path: &Path) {}
+
+pub async fn static_serve_client(path: &Path) {}
 
 impl Service<Request<Body>> for ServeSvelte {
     type Response = Response<Body>;
@@ -38,15 +68,64 @@ impl Service<Request<Body>> for ServeSvelte {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
         let handle = self.handle.clone();
-        let server_path = self.server_path.clone();
+        let config = self.config.clone();
         // TODO: Handle pre-render
 
         Box::pin(async move {
-            let origin = "http://localhost:3000";
-            let uri = req.uri().to_owned();
-            let url = format!("{}{}", origin, uri);
+            let uri = req.uri();
+
+            let path = uri.path();
+            let client_path = config
+                .server_path
+                .join("client")
+                .join(path.strip_prefix("/").unwrap_or(path));
+            println!("CLIENT {}", client_path.display());
+            if client_path.is_file() {
+                let mime = mime_guess::from_path(&client_path).first_or_octet_stream();
+                let file = tokio::fs::read(client_path).await.unwrap();
+                return Ok(Response::builder()
+                    .header(
+                        CONTENT_TYPE,
+                        HeaderValue::from_str(mime.essence_str()).unwrap(),
+                    )
+                    .body(file.into())
+                    .unwrap());
+            }
+
+            let static_path = config
+                .server_path
+                .join("static")
+                .join(path.strip_prefix("/").unwrap_or(path));
+            println!("STATIC {}", static_path.display());
+
+            if static_path.is_file() {
+                let mime = mime_guess::from_path(&static_path).first_or_octet_stream();
+
+                let file = tokio::fs::read(static_path).await.unwrap();
+                return Ok(Response::builder()
+                    .header(
+                        CONTENT_TYPE,
+                        HeaderValue::from_str(mime.essence_str()).unwrap(),
+                    )
+                    .body(file.into())
+                    .unwrap());
+            }
+
+            let url = match config.origin.as_ref() {
+                Some(origin) => format!("{origin}{uri}"),
+                None => {
+                    let derived_origin = get_request_origin(&req);
+                    match derived_origin {
+                        Some(origin) => format!("{origin}{uri}"),
+                        None => {
+                            panic!("error, unable to derive request origin")
+                        }
+                    }
+                }
+            };
+
             let mut request = HttpRequest {
                 url,
                 method: req.method().to_string(),
@@ -64,42 +143,7 @@ impl Service<Request<Body>> for ServeSvelte {
                 println!("{:?}", buffer);
                 request.body = Some(buffer.to_vec().into_boxed_slice())
             }
-            dbg!(&request);
 
-            let path = uri.path();
-            let client_path = server_path
-                .join("client")
-                .join(path.strip_prefix("/").unwrap_or(path));
-            println!("CLIENT {}", client_path.display());
-            if client_path.is_file() {
-                let mime = mime_guess::from_path(&client_path).first_or_octet_stream();
-                let file = tokio::fs::read(client_path).await.unwrap();
-                return Ok(Response::builder()
-                    .header(
-                        CONTENT_TYPE,
-                        HeaderValue::from_str(mime.essence_str()).unwrap(),
-                    )
-                    .body(file.into())
-                    .unwrap());
-            }
-
-            let static_path = server_path
-                .join("static")
-                .join(path.strip_prefix("/").unwrap_or(path));
-            println!("STATIC {}", static_path.display());
-
-            if static_path.is_file() {
-                let mime = mime_guess::from_path(&static_path).first_or_octet_stream();
-
-                let file = tokio::fs::read(static_path).await.unwrap();
-                return Ok(Response::builder()
-                    .header(
-                        CONTENT_TYPE,
-                        HeaderValue::from_str(mime.essence_str()).unwrap(),
-                    )
-                    .body(file.into())
-                    .unwrap());
-            }
             let response = handle.request(request).await.unwrap();
             let mut http_response =
                 Response::builder().status(StatusCode::from_u16(response.status).unwrap());
