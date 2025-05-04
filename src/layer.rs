@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::{
     collections::HashSet,
     convert::Infallible,
@@ -6,11 +7,12 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+use tower_http::services::ServeDir;
 
 use axum_core::body::Body;
 use deno_runtime::deno_core::futures::future::BoxFuture;
-use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, header};
-use http_body_util::BodyExt;
+use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, header};
+use http_body_util::{BodyExt, Empty};
 use tower_service::Service;
 
 use crate::{
@@ -20,16 +22,20 @@ use crate::{
 
 #[derive(Clone)]
 pub struct ServeSvelte {
+    inner: Arc<ServeSvelteInner>,
+}
+
+struct ServeSvelteInner {
     handle: SvelteServerHandle,
-    config: Arc<ServeSvelteConfig>,
-    state: Arc<ServeSvelteState>,
+    client_layer: ServeDir,
+    static_layer: ServeDir,
+    prerendered_layer: ServeDir,
+    config: ServeSvelteConfig,
+    state: ServeSvelteState,
 }
 
 struct ServeSvelteState {
     prerendered: HashSet<String>,
-    client_path: PathBuf,
-    static_path: PathBuf,
-    prerendered_path: PathBuf,
     immutable_path: String,
 }
 
@@ -39,7 +45,7 @@ pub struct ServeSvelteConfig {
 }
 
 impl ServeSvelte {
-    pub async fn create(config: ServeSvelteConfig) -> anyhow::Result<ServeSvelte> {
+    pub async fn create(config: ServeSvelteConfig) -> anyhow::Result<Self> {
         let (response, handle) = SvelteServerRuntime::create(config.server_path.clone()).await?;
 
         let client_path = config.server_path.join("client");
@@ -47,16 +53,26 @@ impl ServeSvelte {
         let prerendered_path = config.server_path.join("prerendered");
         let immutable_path = format!("{}/immutable", response.app_path);
 
+        // First check the client path
+
         Ok(Self {
-            handle,
-            state: Arc::new(ServeSvelteState {
-                prerendered: response.prerendered,
-                client_path,
-                static_path,
-                prerendered_path,
-                immutable_path,
+            inner: Arc::new(ServeSvelteInner {
+                handle,
+                client_layer: ServeDir::new(client_path)
+                    .precompressed_gzip()
+                    .precompressed_br(),
+                static_layer: ServeDir::new(static_path)
+                    .precompressed_gzip()
+                    .precompressed_br(),
+                prerendered_layer: ServeDir::new(prerendered_path)
+                    .precompressed_gzip()
+                    .precompressed_br(),
+                state: ServeSvelteState {
+                    prerendered: response.prerendered,
+                    immutable_path: immutable_path.clone(),
+                },
+                config,
             }),
-            config: Arc::new(config),
         })
     }
 }
@@ -73,61 +89,108 @@ impl Service<Request<Body>> for ServeSvelte {
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         // TODO: Handle pre-render
 
-        let uri = req.uri();
+        let this = self.inner.clone();
 
-        let path = uri.path();
-        let path_without_prefix = path.strip_prefix("/").unwrap_or(path);
+        Box::pin(async move {
+            let (parts, body) = req.into_parts();
+            let request_path = parts.uri.path();
 
-        // Try serving from client directory
-        if let Some(future) = try_serve_from(
-            &self.state.client_path,
-            &self.state.immutable_path,
-            path_without_prefix,
-            true,
-        ) {
-            return future;
-        }
+            if parts.method == Method::GET || parts.method == Method::HEAD {
+                // Try serve client
+                let mut cr = this
+                    .client_layer
+                    .clone()
+                    .call(Request::from_parts(parts.clone(), Empty::<Bytes>::new()))
+                    .await
+                    .unwrap();
 
-        // Try serving from static directory
-        if let Some(future) = try_serve_from(
-            &self.state.static_path,
-            &self.state.immutable_path,
-            path_without_prefix,
-            false,
-        ) {
-            return future;
-        }
+                if cr.status() != StatusCode::NOT_FOUND {
+                    // For successful requests within the immutable path include the immutable cache control header
+                    if cr.status().is_success()
+                        && request_path.starts_with(&this.state.immutable_path)
+                    {
+                        let headers = cr.headers_mut();
+                        headers.append(
+                            header::CACHE_CONTROL,
+                            HeaderValue::from_static("public,max-age=31536000,immutable"),
+                        );
+                    }
 
-        // Serve pre-rendered content
-        if self.state.prerendered.contains(path) {
-            // Try serving from static directory
-            if let Some(future) = try_serve_from(
-                &self.state.prerendered_path,
-                &self.state.immutable_path,
-                path_without_prefix,
-                false,
-            ) {
-                return future;
-            }
-        }
+                    println!("served from client");
+                    return Ok(cr.map(Body::new));
+                }
 
-        // Derive origin early to save on needing to clone the configuration
-        let url = match self.config.origin.as_ref() {
-            Some(origin) => format!("{origin}{uri}"),
-            None => {
-                let derived_origin = get_request_origin(&req);
-                match derived_origin {
-                    Some(origin) => format!("{origin}{uri}"),
-                    None => {
-                        panic!("error, unable to derive request origin")
+                // Try serve static
+                let cr = this
+                    .static_layer
+                    .clone()
+                    .call(Request::from_parts(parts.clone(), Empty::<Bytes>::new()))
+                    .await
+                    .unwrap();
+                if cr.status() != StatusCode::NOT_FOUND {
+                    println!("served from static");
+                    return Ok(cr.map(Body::new));
+                }
+
+                // Serve pre-rendered content
+                if this.state.prerendered.contains(request_path) {
+                    let cr = this
+                        .prerendered_layer
+                        .clone()
+                        .call(Request::from_parts(parts.clone(), Empty::<Bytes>::new()))
+                        .await
+                        .unwrap();
+                    if cr.status() != StatusCode::NOT_FOUND {
+                        println!("served from prerendered");
+                        return Ok(cr.map(Body::new));
+                    }
+
+                    let mut parts = parts.clone();
+
+                    // Append a path segment
+                    let new_path = format!(
+                        "{}.html",
+                        request_path.strip_suffix("/").unwrap_or(request_path)
+                    );
+                    let new_uri = Uri::builder().path_and_query(new_path).build().unwrap();
+                    parts.uri = new_uri;
+
+                    let cr = this
+                        .prerendered_layer
+                        .clone()
+                        .call(Request::from_parts(parts, Empty::<Bytes>::new()))
+                        .await
+                        .unwrap();
+                    if cr.status() != StatusCode::NOT_FOUND {
+                        println!("served from prerendered");
+                        return Ok(cr.map(Body::new));
                     }
                 }
             }
-        };
 
-        let handle = self.handle.clone();
+            // Rebuild original request
+            let req = Request::from_parts(parts, body);
 
-        Box::pin(async move { Ok(dynamic_serve(handle, url, req).await.unwrap()) })
+            // Derive origin early to save on needing to clone the configuration
+            let uri = req.uri();
+            let url = match this.config.origin.as_ref() {
+                Some(origin) => format!("{origin}{uri}"),
+                None => {
+                    let derived_origin = get_request_origin(&req);
+                    match derived_origin {
+                        Some(origin) => format!("{origin}{uri}"),
+                        None => {
+                            panic!("error, unable to derive request origin")
+                        }
+                    }
+                }
+            };
+
+            println!("served from dynamic");
+
+            // Perform a dynamic request
+            Ok(dynamic_serve(&this.handle, url, req).await.unwrap())
+        })
     }
 }
 
@@ -172,7 +235,7 @@ pub async fn static_serve(path: &Path, immutable: bool) -> anyhow::Result<Respon
 }
 
 pub async fn dynamic_serve(
-    handle: SvelteServerHandle,
+    handle: &SvelteServerHandle,
     url: String,
     req: Request<Body>,
 ) -> anyhow::Result<Response<Body>> {
