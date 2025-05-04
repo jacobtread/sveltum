@@ -54,9 +54,21 @@ pub fn get_request_origin(req: &Request<Body>) -> Option<&str> {
 }
 
 /// Serve something statically
-pub async fn static_serve(path: &Path) {}
+pub async fn static_serve(path: &Path) -> anyhow::Result<Response<Body>> {
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let file = tokio::fs::read(path).await?;
+    Ok(Response::builder()
+        .header(CONTENT_TYPE, HeaderValue::from_str(mime.essence_str())?)
+        .body(file.into())?)
+}
 
-pub async fn static_serve_client(path: &Path) {}
+pub async fn static_serve_client(path: &Path) -> anyhow::Result<Response<Body>> {
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let file = tokio::fs::read(path).await?;
+    Ok(Response::builder()
+        .header(CONTENT_TYPE, HeaderValue::from_str(mime.essence_str())?)
+        .body(file.into())?)
+}
 
 impl Service<Request<Body>> for ServeSvelte {
     type Response = Response<Body>;
@@ -68,63 +80,70 @@ impl Service<Request<Body>> for ServeSvelte {
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let handle = self.handle.clone();
-        let config = self.config.clone();
         // TODO: Handle pre-render
 
-        Box::pin(async move {
-            let uri = req.uri();
+        let uri = req.uri();
 
-            let path = uri.path();
-            let client_path = config
-                .server_path
-                .join("client")
-                .join(path.strip_prefix("/").unwrap_or(path));
+        let path = uri.path();
+        let path_without_prefix = path.strip_prefix("/").unwrap_or(path);
+
+        // Try serving from client directory
+        let client_path = self
+            .config
+            .server_path
+            .join("client")
+            .join(path_without_prefix);
+        if client_path.is_file() {
             println!("CLIENT {}", client_path.display());
-            if client_path.is_file() {
-                let mime = mime_guess::from_path(&client_path).first_or_octet_stream();
-                let file = tokio::fs::read(client_path).await.unwrap();
-                return Ok(Response::builder()
-                    .header(
-                        CONTENT_TYPE,
-                        HeaderValue::from_str(mime.essence_str()).unwrap(),
-                    )
-                    .body(file.into())
-                    .unwrap());
-            }
+            return Box::pin(async move {
+                return Ok(static_serve_client(&client_path).await.unwrap());
+            });
+        }
 
-            let static_path = config
-                .server_path
-                .join("static")
-                .join(path.strip_prefix("/").unwrap_or(path));
+        // Try serving from static directory
+        let static_path = self
+            .config
+            .server_path
+            .join("static")
+            .join(path_without_prefix);
+        if static_path.is_file() {
             println!("STATIC {}", static_path.display());
+            return Box::pin(async move {
+                return Ok(static_serve(&static_path).await.unwrap());
+            });
+        }
 
-            if static_path.is_file() {
-                let mime = mime_guess::from_path(&static_path).first_or_octet_stream();
-
-                let file = tokio::fs::read(static_path).await.unwrap();
-                return Ok(Response::builder()
-                    .header(
-                        CONTENT_TYPE,
-                        HeaderValue::from_str(mime.essence_str()).unwrap(),
-                    )
-                    .body(file.into())
-                    .unwrap());
+        // Serve pre-rendered content
+        if self.state.prerendered.contains(path) {
+            let file_path = self
+                .config
+                .server_path
+                .join("prerendered")
+                .join(path_without_prefix);
+            if file_path.is_file() {
+                println!("PRERENDERED {}", file_path.display());
+                return Box::pin(async move {
+                    return Ok(static_serve(&file_path).await.unwrap());
+                });
             }
+        }
 
-            let url = match config.origin.as_ref() {
-                Some(origin) => format!("{origin}{uri}"),
-                None => {
-                    let derived_origin = get_request_origin(&req);
-                    match derived_origin {
-                        Some(origin) => format!("{origin}{uri}"),
-                        None => {
-                            panic!("error, unable to derive request origin")
-                        }
+        let url = match self.config.origin.as_ref() {
+            Some(origin) => format!("{origin}{uri}"),
+            None => {
+                let derived_origin = get_request_origin(&req);
+                match derived_origin {
+                    Some(origin) => format!("{origin}{uri}"),
+                    None => {
+                        panic!("error, unable to derive request origin")
                     }
                 }
-            };
+            }
+        };
 
+        let handle = self.handle.clone();
+
+        Box::pin(async move {
             let mut request = HttpRequest {
                 url,
                 method: req.method().to_string(),
