@@ -1,16 +1,16 @@
-use serde::{Deserialize, Serialize};
+use bytes::Bytes;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct HttpRequest {
     pub url: String,
     pub method: String,
     pub headers: Vec<(String, String)>,
-    pub body: Option<Box<[u8]>>,
+    pub body: Option<Bytes>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    pub body: Bytes,
 }

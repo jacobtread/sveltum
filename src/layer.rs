@@ -14,7 +14,7 @@ use deno_runtime::deno_core::futures::future::BoxFuture;
 use http::{
     HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, header, request::Parts,
 };
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Empty, Full};
 use tower_service::Service;
 
 use crate::{
@@ -243,11 +243,7 @@ pub async fn dynamic_serve(
         let body = req.into_body().collect().await?;
         let body = body.to_bytes();
 
-        // Turn the collection of bytes into a boxed slice so we can send
-        // it over to JS
-        let boxed_slice = body.to_vec().into_boxed_slice();
-
-        request.body = Some(boxed_slice)
+        request.body = Some(body)
     }
 
     let response = handle.request(request).await.unwrap();
@@ -258,7 +254,8 @@ pub async fn dynamic_serve(
             http_response.header(HeaderName::from_str(&name)?, HeaderValue::from_str(&value)?);
     }
 
-    let http_response = http_response.body(response.body.into())?;
+    let body = Body::new(Full::new(response.body));
+    let http_response = http_response.body(body)?;
 
     Ok(http_response)
 }

@@ -1,4 +1,5 @@
 use anyhow::Context;
+use bytes::Bytes;
 use deno_resolver::npm::{DenoInNpmPackageChecker, NpmResolver};
 use deno_runtime::{
     deno_core::{
@@ -171,10 +172,13 @@ pub fn convert_worker_response(
     let local_value: Local<'_, Value> = Local::new(scope, response);
     let response: JsHttpResponse = from_v8(scope, local_value)?;
 
+    let bytes = response.body.as_ref();
+    let body = Bytes::copy_from_slice(bytes);
+
     Ok(HttpResponse {
         status: response.status,
         headers: response.headers,
-        body: Vec::from(response.body.as_ref()),
+        body,
     })
 }
 
@@ -193,6 +197,8 @@ pub fn invoke_handle_request(
     // Create a callable local function for the createServer function
     let handle_fn = Local::new(scope, handle_fn).cast::<Function>();
 
+    let body = request.body.map(|body| ToJsBuffer::from(body.to_vec()));
+
     // Turn the server path into a js value
     let request_value = to_v8(
         scope,
@@ -200,7 +206,7 @@ pub fn invoke_handle_request(
             url: request.url,
             method: request.method,
             headers: request.headers,
-            body: request.body.map(ToJsBuffer::from),
+            body,
         },
     )?;
 

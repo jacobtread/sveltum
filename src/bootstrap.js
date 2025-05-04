@@ -23,7 +23,9 @@
             // Create a response object for Rust
             const status = response.status;
             const headers = response.headers;
-            const body = await response.bytes();
+            const body = await response.arrayBuffer();
+
+
 
             return {
                 status,
