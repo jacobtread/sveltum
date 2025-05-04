@@ -1,0 +1,51 @@
+{
+	"name": "svelte-adapter-sveltum",
+	"version": "0.1.0",
+	"description": "Adapter for SvelteKit apps that generates a binding for sveltum",
+	"keywords": [],
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/jacobtread/sveltum"
+	},
+	"license": "MIT",
+	"homepage": "https://github.com/jacobtread/sveltum",
+	"type": "module",
+	"exports": {
+		".": {
+			"types": "./index.d.ts",
+			"import": "./index.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"types": "index.d.ts",
+	"files": [
+		"files",
+		"index.js",
+		"index.d.ts",
+		"ambient.d.ts"
+	],
+	"scripts": {
+		"dev": "npm run clean && rollup -cw",
+		"build": "npm run clean && rollup -c",
+		"clean": "node -e \"fs.rmSync('files', { force: true, recursive: true })\"",
+		"check": "tsc",
+		"lint": "prettier --check .",
+		"format": "npm lint --write",
+		"prepublishOnly": "npm build"
+	},
+	"devDependencies": {
+		"@sveltejs/kit": "^2.4.0",
+		"@sveltejs/vite-plugin-svelte": "^5.0.1",
+		"@types/node": "^18.19.48",
+		"typescript": "^5.3.3"
+	},
+	"dependencies": {
+		"@rollup/plugin-commonjs": "^28.0.1",
+		"@rollup/plugin-json": "^6.1.0",
+		"@rollup/plugin-node-resolve": "^16.0.0",
+		"rollup": "^4.9.5"
+	},
+	"peerDependencies": {
+		"@sveltejs/kit": "^2.4.0"
+	}
+}
