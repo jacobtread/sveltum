@@ -1,8 +1,11 @@
 use deno_runtime::{
-    deno_core::{JsRuntime, PollEventLoopOptions},
+    deno_core::{JsRuntime, PollEventLoopOptions, futures::FutureExt},
     deno_napi::v8::{Global, Value},
 };
-use std::{cell::RefCell, collections::HashSet, path::PathBuf, pin::Pin, rc::Rc, task::Poll};
+use std::{
+    cell::RefCell, collections::HashSet, future::poll_fn, path::PathBuf, pin::Pin, rc::Rc,
+    task::Poll,
+};
 use tokio::{
     sync::{mpsc, oneshot},
     task::{LocalSet, spawn_local},
@@ -90,10 +93,37 @@ impl SvelteServerRuntime {
                 return;
             }
 
+            let worker = server_runtime.worker.clone();
+
             // Setup task set and spawn the runtime task
-            let local_set = LocalSet::new();
+            let mut local_set = LocalSet::new();
             local_set.spawn_local(server_runtime);
-            runtime.block_on(local_set)
+
+            runtime.block_on(poll_fn(move |cx| {
+                // Poll the current future once
+                if local_set.poll_unpin(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+
+                if let Poll::Ready(t) = {
+                    // Poll the runtime
+                    worker
+                        .borrow_mut()
+                        .poll_event_loop(cx, PollEventLoopOptions::default())
+                } {
+                    // Runtime returned error
+                    if t.is_err() {
+                        return Poll::Ready(());
+                    }
+
+                    // Try polling future set again for finished promises
+                    if local_set.poll_unpin(cx).is_ready() {
+                        return Poll::Ready(());
+                    }
+                }
+
+                Poll::Pending
+            }));
         });
 
         let response = init_rx.await??;
@@ -131,49 +161,37 @@ impl Future for SvelteServerRuntime {
                 None => break,
             };
 
-            let handler = this.handler.clone();
             let worker = this.worker.clone();
 
+            // Invoke the request handler
+            let promise_future = {
+                let worker: &mut JsRuntime = &mut worker.borrow_mut();
+                let global_promise = match invoke_handle_request(worker, &this.handler, request) {
+                    Ok(value) => value,
+
+                    // Handle invoke error
+                    Err(err) => {
+                        _ = tx.send(Err(err));
+                        continue;
+                    }
+                };
+                worker.resolve(global_promise)
+            };
+
             spawn_local(async move {
-                let response = handle_worker_request(worker, request, handler).await;
+                let response = promise_future
+                    .await
+                    .map_err(anyhow::Error::new)
+                    // Translate the response body
+                    .and_then(|response| {
+                        let worker: &mut JsRuntime = &mut worker.borrow_mut();
+                        convert_worker_response(worker, response)
+                    });
+
                 _ = tx.send(response);
             });
         }
 
-        // Poll the event loop
-        if this
-            .worker
-            .borrow_mut()
-            .poll_event_loop(cx, PollEventLoopOptions::default())
-            .is_ready()
-        {
-            // Event loop is complete and the channel is closed (We are finished)
-            if this.rx.is_closed() {
-                return Poll::Ready(());
-            }
-        }
-
         Poll::Pending
     }
-}
-
-/// Processes a request using the provided worker
-async fn handle_worker_request(
-    worker: Rc<RefCell<JsRuntime>>,
-    request: HttpRequest,
-    handle_fn: Global<Value>,
-) -> anyhow::Result<HttpResponse> {
-    // Invoke the JS handler to get a promise for the response
-    let response_promise = {
-        let worker = &mut *worker.borrow_mut();
-        let global_promise = invoke_handle_request(worker, &handle_fn, request)?;
-        worker.resolve(global_promise)
-    };
-
-    // Wait for the response promise
-    let response = response_promise.await?;
-
-    // Translate the response body
-    let mut worker = worker.borrow_mut();
-    convert_worker_response(&mut worker, response)
 }

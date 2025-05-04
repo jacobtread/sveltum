@@ -11,7 +11,7 @@
                 body: request.body ?? undefined,
             });
 
-            console.log(nodeRequest)
+
 
             // Pass the request onto svelte to handle
             /** @type {Response} */
@@ -64,7 +64,6 @@
                 prerendered: Array.from(prerendered)
             };
         } catch (err) {
-            console.error(err);
             throw err;
         }
     }
