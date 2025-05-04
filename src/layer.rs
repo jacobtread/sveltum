@@ -13,7 +13,10 @@ use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, heade
 use http_body_util::BodyExt;
 use tower_service::Service;
 
-use crate::runtime::{HttpRequest, SvelteServerHandle, SvelteServerRuntime};
+use crate::{
+    core::HttpRequest,
+    runtime::{SvelteServerHandle, SvelteServerRuntime},
+};
 
 #[derive(Clone)]
 pub struct ServeSvelte {
