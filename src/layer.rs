@@ -42,9 +42,7 @@ impl ServeSvelte {
         let client_path = config.server_path.join("client");
         let static_path = config.server_path.join("static");
         let prerendered_path = config.server_path.join("prerendered");
-
-        // TODO: Derive app path
-        let immutable_path = "_app/immutable".to_string();
+        let immutable_path = format!("{}/immutable", response.app_path);
 
         Ok(Self {
             handle,

@@ -59,7 +59,7 @@
             return {
                 handler: createRequestHandler(server),
                 manifest: {
-                    appPath: manifest.appPath,
+                    app_path: manifest.appPath,
                 },
                 prerendered: Array.from(prerendered)
             };

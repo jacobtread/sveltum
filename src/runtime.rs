@@ -26,6 +26,7 @@ use crate::queue::WakerQueue;
 
 pub struct InitializedResponse {
     pub prerendered: HashSet<String>,
+    pub app_path: String,
 }
 
 pub enum SvelteServerMessage {
@@ -140,11 +141,12 @@ impl SvelteServerRuntime {
                 rx: handle_rx,
                 local_set: LocalSet::new(),
                 response_queue: Default::default(),
-                server_object,
+                handler: server_object.handler,
             };
 
             if let Err(cause) = init_tx.send(InitializedResponse {
-                prerendered: server_runtime.server_object.prerendered.clone(),
+                prerendered: server_object.prerendered,
+                app_path: server_object.manifest.app_path,
             }) {
                 // Creator of the handle dropped the future already, don't keep going
                 return;
@@ -185,7 +187,7 @@ pub struct SvelteServerRuntime {
     response_queue: WakerQueue<ResponseEntry>,
 
     /// Server handling object
-    server_object: ServerObject,
+    handler: v8::Global<v8::Value>,
 }
 
 struct SvelteServerRuntimeFuture {
@@ -206,6 +208,11 @@ struct JsHttpRequest {
     method: String,
     headers: Vec<(String, String)>,
     body: Option<ToJsBuffer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsManifest {
+    app_path: String,
 }
 
 impl Future for SvelteServerRuntimeFuture {
@@ -252,12 +259,9 @@ impl Future for SvelteServerRuntimeFuture {
 
             match msg {
                 SvelteServerMessage::HttpRequest { request, tx } => {
-                    let global_promise = invoke_handle_request(
-                        &mut runtime.worker,
-                        &runtime.server_object.handler,
-                        request,
-                    )
-                    .unwrap();
+                    let global_promise =
+                        invoke_handle_request(&mut runtime.worker, &runtime.handler, request)
+                            .unwrap();
                     let resolve = runtime.worker.resolve(global_promise);
                     let res_queue = runtime.response_queue.clone();
                     runtime.local_set.spawn_local(async move {
@@ -315,9 +319,10 @@ async fn resolve_promise(
         .map_err(anyhow::Error::new)
 }
 
-pub struct ServerObject {
-    pub handler: v8::Global<v8::Value>,
-    pub prerendered: HashSet<String>,
+struct ServerObject {
+    handler: v8::Global<v8::Value>,
+    prerendered: HashSet<String>,
+    manifest: JsManifest,
 }
 
 fn parse_server_object(
@@ -344,11 +349,20 @@ fn parse_server_object(
         .get(scope, prerendered_key)
         .context("failed to get prerendered")?;
 
+    let manifest_key = v8::String::new(scope, "manifest")
+        .context("failed to make manifest key")?
+        .try_cast()?;
+    let manifest = server_object
+        .get(scope, manifest_key)
+        .context("failed to get manifest")?;
+
     let prerendered: Vec<String> = from_v8(scope, prerendered)?;
+    let manifest: JsManifest = from_v8(scope, manifest)?;
 
     Ok(ServerObject {
         handler: Global::new(scope, handler),
         prerendered: prerendered.into_iter().collect(),
+        manifest,
     })
 }
 
