@@ -3,12 +3,11 @@ use bytes::Bytes;
 use deno_resolver::npm::{DenoInNpmPackageChecker, NpmResolver};
 use deno_runtime::{
     deno_core::{
-        FastStaticString, FsModuleLoader, JsBuffer, JsRuntime, ModuleSpecifier,
-        PollEventLoopOptions, ToJsBuffer, ascii_str_include,
+        FsModuleLoader, JsBuffer, JsRuntime, ModuleSpecifier, PollEventLoopOptions, ToJsBuffer,
         serde_v8::{self, from_v8, to_v8},
     },
     deno_fs::RealFs,
-    deno_napi::v8::{Function, Global, Local, Value},
+    deno_napi::v8::{Function, Global, Local, Object, Value},
     deno_permissions::PermissionsContainer,
     permissions::RuntimePermissionDescriptorParser,
     worker::{MainWorker, WorkerOptions, WorkerServiceOptions},
@@ -17,10 +16,6 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, path::PathBuf, rc::Rc, sync::Arc};
 
 use crate::core::{HttpRequest, HttpResponse};
-
-/// Bootstrap script which handles creation of servers and the request handler
-/// function
-const BOOTSTRAP_SCRIPT: FastStaticString = ascii_str_include!("bootstrap.js");
 
 pub struct ServerObject {
     /// Request handler function object from JS
@@ -62,14 +57,14 @@ struct JsManifest {
     app_path: String,
 }
 
-pub fn create_js_worker() -> JsRuntime {
+pub fn create_js_worker(main_module: &ModuleSpecifier) -> JsRuntime {
     let permissions = PermissionsContainer::allow_all(Arc::new(
         RuntimePermissionDescriptorParser::new(sys_traits::impls::RealSys),
     ));
 
     let worker = MainWorker::bootstrap_from_options(
         // We do not have a "real" main module so this is just a placeholder (We don't use it)
-        &ModuleSpecifier::parse("file://dev/null").expect("failed to create file path url"),
+        main_module,
         // Configuration
         WorkerServiceOptions::<
             DenoInNpmPackageChecker,
@@ -103,30 +98,32 @@ pub fn create_js_worker() -> JsRuntime {
 
 pub async fn init_server(
     runtime: &mut JsRuntime,
-    server_path: PathBuf,
+    main_module: &ModuleSpecifier,
 ) -> anyhow::Result<ServerObject> {
-    let bootstrap_fn = runtime.execute_script("bootstrap.js", BOOTSTRAP_SCRIPT)?;
-    let server_object_promise = create_server_object(runtime, bootstrap_fn, server_path)?;
+    // Load the main module
+    let module_id = runtime.load_main_es_module(main_module).await?;
 
-    let server_object_future = runtime.resolve(server_object_promise);
-    let server_object = runtime
-        .with_event_loop_promise(server_object_future, PollEventLoopOptions::default())
-        .await
-        .map_err(anyhow::Error::new)?;
+    // Evaluate the main module
+    let eval_future = runtime.mod_evaluate(module_id);
+    runtime
+        .with_event_loop_future(eval_future, PollEventLoopOptions::default())
+        .await?;
 
-    let server_object = parse_server_object(runtime, server_object)?;
+    let namespace = runtime.get_module_namespace(module_id)?;
+
+    let server_object = parse_server_object(runtime, namespace)?;
 
     Ok(server_object)
 }
 
 fn parse_server_object(
     runtime: &mut JsRuntime,
-    server_object: Global<Value>,
+    server_object: Global<Object>,
 ) -> anyhow::Result<ServerObject> {
     // Get the handle scope
     let scope = &mut runtime.handle_scope();
 
-    let server_object = Local::new(scope, server_object);
+    let server_object = Local::new(scope, server_object).cast();
     let server_object: JsServerObject = from_v8(scope, server_object)?;
 
     Ok(ServerObject {

@@ -1,5 +1,5 @@
 use deno_runtime::{
-    deno_core::{JsRuntime, PollEventLoopOptions, futures::FutureExt},
+    deno_core::{JsRuntime, ModuleSpecifier, PollEventLoopOptions, futures::FutureExt},
     deno_napi::v8::{Global, Value},
 };
 use std::{
@@ -62,18 +62,26 @@ impl SvelteServerRuntime {
                 }
             };
 
+            let main_module_path = server_path.join("index.js");
+            let main_module = match ModuleSpecifier::from_file_path(main_module_path) {
+                Ok(value) => value,
+                Err(err) => {
+                    _ = init_tx.send(Err(anyhow::Error::msg("invalid main module path")));
+                    return;
+                }
+            };
+
             // Create the JS worker
-            let mut worker = create_js_worker();
+            let mut worker = create_js_worker(&main_module);
 
             // Initialize the svelte server
-            let server_object =
-                match runtime.block_on(init_server(&mut worker, server_path.clone())) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        _ = init_tx.send(Err(err));
-                        return;
-                    }
-                };
+            let server_object = match runtime.block_on(init_server(&mut worker, &main_module)) {
+                Ok(value) => value,
+                Err(err) => {
+                    _ = init_tx.send(Err(err));
+                    return;
+                }
+            };
 
             let server_runtime = Self {
                 worker: Rc::new(RefCell::new(worker)),
