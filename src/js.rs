@@ -7,7 +7,7 @@ use deno_runtime::{
         serde_v8::{self, from_v8, to_v8},
     },
     deno_fs::RealFs,
-    deno_napi::v8::{self, Function, Global, Local, Object, Value},
+    deno_napi::v8::{Function, Global, Local, Value},
     deno_permissions::PermissionsContainer,
     permissions::RuntimePermissionDescriptorParser,
     worker::{MainWorker, WorkerOptions, WorkerServiceOptions},
@@ -17,14 +17,20 @@ use std::{collections::HashSet, path::PathBuf, rc::Rc, sync::Arc};
 
 use crate::core::{HttpRequest, HttpResponse};
 
+/// Bootstrap script which handles creation of servers and the request handler
+/// function
 const BOOTSTRAP_SCRIPT: FastStaticString = ascii_str_include!("bootstrap.js");
 
 pub struct ServerObject {
+    /// Request handler function object from JS
     pub handler: Global<Value>,
+    /// Hash set of pre-rendered routes for the svelte app
     pub prerendered: HashSet<String>,
+    /// SvelteKit app path from the manifest
     pub app_path: String,
 }
 
+/// Wrapper for deserializing a created server object from a JS value
 #[derive(Deserialize)]
 struct JsServerObject<'a> {
     handler: serde_v8::Value<'a>,
@@ -32,6 +38,7 @@ struct JsServerObject<'a> {
     manifest: JsManifest,
 }
 
+/// Wrapper for deserializing a response from a JS value
 #[derive(Deserialize)]
 struct JsHttpResponse {
     status: u16,
@@ -39,6 +46,7 @@ struct JsHttpResponse {
     body: JsBuffer,
 }
 
+/// Wrapper for serializing a HTTP request to a JS value
 #[derive(Serialize)]
 struct JsHttpRequest {
     url: String,
@@ -47,6 +55,7 @@ struct JsHttpRequest {
     body: Option<ToJsBuffer>,
 }
 
+/// Wrapper for deserializing a svelte manifest from a JS value
 #[derive(Debug, Deserialize)]
 struct JsManifest {
     app_path: String,
@@ -159,7 +168,7 @@ pub fn convert_worker_response(
     let scope = &mut runtime.handle_scope();
 
     // Convert JS value into Rust value
-    let local_value: Local<'_, Value> = Local::new(scope, &response);
+    let local_value: Local<'_, Value> = Local::new(scope, response);
     let response: JsHttpResponse = from_v8(scope, local_value)?;
 
     Ok(HttpResponse {
