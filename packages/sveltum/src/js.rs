@@ -1,3 +1,4 @@
+use crate::core::{HttpRequest, HttpResponse};
 use anyhow::Context;
 use bytes::Bytes;
 use deno_resolver::npm::{DenoInNpmPackageChecker, NpmResolver};
@@ -13,9 +14,7 @@ use deno_runtime::{
     worker::{MainWorker, WorkerOptions, WorkerServiceOptions},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, path::PathBuf, rc::Rc, sync::Arc};
-
-use crate::core::{HttpRequest, HttpResponse};
+use std::{collections::HashSet, rc::Rc, sync::Arc};
 
 pub struct ServerObject {
     /// Request handler function object from JS
@@ -131,31 +130,6 @@ fn parse_server_object(
         prerendered: server_object.prerendered.into_iter().collect(),
         app_path: server_object.manifest.app_path,
     })
-}
-
-/// Creates and initializes new svelte server object
-fn create_server_object(
-    runtime: &mut JsRuntime,
-    bootstrap: Global<Value>,
-    server_path: PathBuf,
-) -> anyhow::Result<Global<Value>> {
-    // Get the handle scope
-    let scope = &mut runtime.handle_scope();
-
-    // Get the global object
-    let global = scope.get_current_context().global(scope).cast();
-
-    // Create a callable local function for the createServer function
-    let create_server_fn = Local::new(scope, &bootstrap).cast::<Function>();
-
-    // Turn the server path into a js value
-    let path_value = to_v8(scope, server_path)?;
-
-    let output = create_server_fn
-        .call(scope, global, &[path_value])
-        .context("failed to create server object")?;
-
-    Ok(Global::new(scope, output))
 }
 
 pub fn convert_worker_response(

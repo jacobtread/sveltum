@@ -3,6 +3,7 @@ use std::{
     collections::HashSet,
     convert::Infallible,
     path::PathBuf,
+    pin::Pin,
     str::FromStr,
     sync::Arc,
     task::{Context, Poll},
@@ -10,17 +11,15 @@ use std::{
 use tower_http::services::ServeDir;
 
 use axum_core::body::Body;
-use deno_runtime::deno_core::futures::future::BoxFuture;
 use http::{
     HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, header, request::Parts,
 };
 use http_body_util::{BodyExt, Empty, Full};
-use tower_service::Service;
-
-use crate::{
+use sveltum::{
     core::HttpRequest,
     runtime::{SvelteServerHandle, SvelteServerRuntime},
 };
+use tower_service::Service;
 
 #[derive(Clone)]
 pub struct ServeSvelte {
@@ -81,29 +80,31 @@ impl ServeSvelte {
     }
 }
 
-pub async fn try_serve_with(parts: Parts, layer: &mut ServeDir) -> Option<Response<Body>> {
-    let request = Request::from_parts(parts, Empty::<Bytes>::new());
+impl ServeSvelte {
+    async fn try_serve_with(parts: Parts, layer: &mut ServeDir) -> Option<Response<Body>> {
+        let request = Request::from_parts(parts, Empty::<Bytes>::new());
 
-    // Try and serve with the layer
-    let cr = match layer.call(request).await {
-        Ok(value) => value,
-        Err(err) => match err {},
-    };
+        // Try and serve with the layer
+        let cr = match layer.call(request).await {
+            Ok(value) => value,
+            Err(err) => match err {},
+        };
 
-    // Got a not found response
-    if cr.status() == StatusCode::NOT_FOUND {
-        return None;
+        // Got a not found response
+        if cr.status() == StatusCode::NOT_FOUND {
+            return None;
+        }
+
+        Some(cr.map(Body::new))
     }
 
-    Some(cr.map(Body::new))
-}
-
-impl ServeSvelte {
     async fn try_serve_static(parts: &Parts, this: &ServeSvelteInner) -> Option<Response<Body>> {
         let request_path = parts.uri.path();
 
         // Try serve client
-        if let Some(mut cr) = try_serve_with(parts.clone(), &mut this.client_layer.clone()).await {
+        if let Some(mut cr) =
+            Self::try_serve_with(parts.clone(), &mut this.client_layer.clone()).await
+        {
             // For successful requests within the immutable path include the immutable cache control header
             if cr.status().is_success() && request_path.starts_with(&this.state.immutable_path) {
                 let headers = cr.headers_mut();
@@ -118,7 +119,8 @@ impl ServeSvelte {
         }
 
         // Try serve static
-        if let Some(cr) = try_serve_with(parts.clone(), &mut this.static_layer.clone()).await {
+        if let Some(cr) = Self::try_serve_with(parts.clone(), &mut this.static_layer.clone()).await
+        {
             println!("served from static");
             return Some(cr);
         }
@@ -128,7 +130,7 @@ impl ServeSvelte {
             let mut prerendered_layer = this.prerendered_layer.clone();
 
             // Try serve static
-            if let Some(cr) = try_serve_with(parts.clone(), &mut prerendered_layer).await {
+            if let Some(cr) = Self::try_serve_with(parts.clone(), &mut prerendered_layer).await {
                 println!("served from prerendered");
                 return Some(cr);
             }
@@ -147,7 +149,7 @@ impl ServeSvelte {
             parts.uri = uri;
 
             // Try serve static
-            if let Some(cr) = try_serve_with(parts, &mut prerendered_layer).await {
+            if let Some(cr) = Self::try_serve_with(parts, &mut prerendered_layer).await {
                 println!("served from prerendered (.html)");
                 return Some(cr);
             }
@@ -160,7 +162,8 @@ impl ServeSvelte {
 impl Service<Request<Body>> for ServeSvelte {
     type Response = Response<Body>;
     type Error = Infallible;
-    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -218,12 +221,12 @@ impl Service<Request<Body>> for ServeSvelte {
     }
 }
 
-pub fn get_request_origin(req: &Request<Body>) -> Option<&str> {
+fn get_request_origin(req: &Request<Body>) -> Option<&str> {
     let origin = req.headers().get(header::ORIGIN)?;
     origin.to_str().ok()
 }
 
-pub async fn dynamic_serve(
+async fn dynamic_serve(
     handle: &SvelteServerHandle,
     url: String,
     req: Request<Body>,

@@ -4046,9 +4046,9 @@ dependencies = [
 
 [[package]]
 name = "libm"
-version = "0.2.14"
+version = "0.2.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a25169bd5913a4b437588a7e3d127cd6e90127b60e0ffbd834a38f1599e016b8"
+checksum = "c9627da5196e5d8ed0b0495e61e518847578da83483c37288316d9b2e03a7f72"
 
 [[package]]
 name = "libredox"
@@ -5339,9 +5339,9 @@ dependencies = [
 
 [[package]]
 name = "redox_syscall"
-version = "0.5.12"
+version = "0.5.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "928fca9cf2aa042393a8325b9ead81d2f0df4cb12e1e24cef072922ccd99c5af"
+checksum = "d2f103c6d277498fbceb16e84d317e2a400f160f46904d5f5410848c829511a3"
 dependencies = [
  "bitflags 2.9.0",
 ]
@@ -6212,24 +6212,15 @@ name = "sveltum"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum-core 0.5.2",
  "bytes",
  "deno_resolver",
  "deno_runtime",
+ "http 1.3.1",
+ "http-body-util",
  "serde",
  "sys_traits",
  "tokio",
-]
-
-[[package]]
-name = "sveltum-axum-layer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum-core 0.5.2",
- "bytes",
- "http 1.3.1",
- "http-body-util",
- "sveltum",
  "tower-http",
  "tower-service",
 ]
