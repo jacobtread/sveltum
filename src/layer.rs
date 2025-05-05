@@ -81,8 +81,8 @@ impl ServeSvelte {
     }
 }
 
-pub async fn try_serve_with(parts: &Parts, layer: &mut ServeDir) -> Option<Response<Body>> {
-    let request = Request::from_parts(parts.clone(), Empty::<Bytes>::new());
+pub async fn try_serve_with(parts: Parts, layer: &mut ServeDir) -> Option<Response<Body>> {
+    let request = Request::from_parts(parts, Empty::<Bytes>::new());
 
     // Try and serve with the layer
     let cr = match layer.call(request).await {
@@ -103,7 +103,7 @@ impl ServeSvelte {
         let request_path = parts.uri.path();
 
         // Try serve client
-        if let Some(mut cr) = try_serve_with(parts, &mut this.client_layer.clone()).await {
+        if let Some(mut cr) = try_serve_with(parts.clone(), &mut this.client_layer.clone()).await {
             // For successful requests within the immutable path include the immutable cache control header
             if cr.status().is_success() && request_path.starts_with(&this.state.immutable_path) {
                 let headers = cr.headers_mut();
@@ -118,7 +118,7 @@ impl ServeSvelte {
         }
 
         // Try serve static
-        if let Some(cr) = try_serve_with(parts, &mut this.static_layer.clone()).await {
+        if let Some(cr) = try_serve_with(parts.clone(), &mut this.static_layer.clone()).await {
             println!("served from static");
             return Some(cr);
         }
@@ -128,7 +128,7 @@ impl ServeSvelte {
             let mut prerendered_layer = this.prerendered_layer.clone();
 
             // Try serve static
-            if let Some(cr) = try_serve_with(parts, &mut prerendered_layer).await {
+            if let Some(cr) = try_serve_with(parts.clone(), &mut prerendered_layer).await {
                 println!("served from prerendered");
                 return Some(cr);
             }
@@ -136,15 +136,18 @@ impl ServeSvelte {
             let mut parts = parts.clone();
 
             // Append a path segment
-            let new_path = format!(
+            let path_with_ext = format!(
                 "{}.html",
                 request_path.strip_suffix("/").unwrap_or(request_path)
             );
-            let new_uri = Uri::builder().path_and_query(new_path).build().unwrap();
-            parts.uri = new_uri;
+            let uri = Uri::builder()
+                .path_and_query(path_with_ext)
+                .build()
+                .expect("changing the path of a url should never fail");
+            parts.uri = uri;
 
             // Try serve static
-            if let Some(cr) = try_serve_with(&parts, &mut prerendered_layer).await {
+            if let Some(cr) = try_serve_with(parts, &mut prerendered_layer).await {
                 println!("served from prerendered (.html)");
                 return Some(cr);
             }
@@ -193,7 +196,7 @@ impl Service<Request<Body>> for ServeSvelte {
                     return Ok(Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .body(Body::empty())
-                        .unwrap());
+                        .expect("creating a response with an empty body will never fail"));
                 }
             };
 
@@ -206,7 +209,7 @@ impl Service<Request<Body>> for ServeSvelte {
                     return Ok(Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .body(Body::empty())
-                        .unwrap());
+                        .expect("creating a response with an empty body will never fail"));
                 }
             };
 
@@ -225,28 +228,38 @@ pub async fn dynamic_serve(
     url: String,
     req: Request<Body>,
 ) -> anyhow::Result<Response<Body>> {
-    let method = req.method();
+    let (parts, body) = req.into_parts();
 
-    let mut request = HttpRequest {
-        url,
-        method: method.to_string(),
-        headers: req
-            .headers()
-            .iter()
-            .map(|(key, value)| (key.to_string(), value.to_str().unwrap().to_string()))
-            .collect(),
-        body: None,
-    };
+    let method = parts.method;
 
-    if !matches!(*method, Method::GET | Method::HEAD) {
-        // Read the request body
-        let body = req.into_body().collect().await?;
-        let body = body.to_bytes();
+    // Collect headers from incoming request
+    let request_headers = parts.headers;
+    let mut headers = Vec::with_capacity(request_headers.len());
 
-        request.body = Some(body)
+    for (key, value) in request_headers.iter() {
+        headers.push((key.to_string(), value.to_str()?.to_string()));
     }
 
-    let response = handle.request(request).await.unwrap();
+    let method_string = method.to_string();
+    let body = match method {
+        Method::GET | Method::HEAD => {
+            // Read the request body
+            let body = body.collect().await?;
+            let body = body.to_bytes();
+
+            Some(body)
+        }
+        _ => None,
+    };
+
+    let request = HttpRequest {
+        url,
+        method: method_string,
+        headers,
+        body,
+    };
+
+    let response = handle.request(request).await?;
     let mut http_response = Response::builder().status(StatusCode::from_u16(response.status)?);
 
     for (name, value) in response.headers {
