@@ -4,17 +4,28 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.98"
-axum-core = "0.5.2"
-bytes = "1.10.1"
-deno_resolver = "0.35.0"
-deno_runtime = { version = "0.212.0", features = ["transpile"] }
+# Error type
+anyhow = "1"
+
+# Bytes type
+bytes = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+
+# Tokio runtime for driving the JS runtime futures
+tokio = { version = "1", features = ["rt", "sync", "parking_lot"] }
+
+# HTTP and HTTP body types
 http = "1.3.1"
 http-body-util = "0.1.3"
-mime = "0.3.17"
-mime_guess = "2.0.5"
-serde = { version = "1.0.219", features = ["derive"] }
-sys_traits = "0.1.9"
-tokio = { version = "1.44.2", features = ["full"] }
+
+# Tower services and tower http for ServeDir
+axum-core = "0.5.2"
 tower-http = { version = "0.6.2", features = ["fs"] }
 tower-service = "0.3.3"
+
+# Deno runtime for JavaScript
+deno_resolver = "0.35.0"
+deno_runtime = { version = "0.212.0", features = ["transpile"] }
+sys_traits = "0.1.9"
