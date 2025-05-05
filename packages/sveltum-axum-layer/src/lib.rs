@@ -1,25 +1,38 @@
 use bytes::Bytes;
+use fs::{
+    async_read_body::AsyncReadBody,
+    content_encoding::{Encoding, encodings},
+    open_file::{FileOpened, FileRequestExtent, OpenFileOutput, OpenFileSettings, open_file},
+};
+use headers::{IfModifiedSince, IfUnmodifiedSince};
+use percent_encoding::percent_decode;
 use std::{
     collections::HashSet,
     convert::Infallible,
-    path::PathBuf,
+    io,
+    path::{Component, Path, PathBuf},
     pin::Pin,
     str::FromStr,
     sync::Arc,
     task::{Context, Poll},
 };
-use tower_http::services::ServeDir;
 
 use axum_core::body::Body;
 use http::{
     HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, header, request::Parts,
 };
-use http_body_util::{BodyExt, Empty, Full};
+use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
 use sveltum::{
     core::HttpRequest,
     runtime::{SvelteServerHandle, SvelteServerRuntime},
 };
 use tower_service::Service;
+
+mod fs;
+mod headers;
+
+// default capacity 64KiB
+const DEFAULT_CAPACITY: usize = 65536;
 
 #[derive(Clone)]
 pub struct ServeSvelte {
@@ -28,9 +41,11 @@ pub struct ServeSvelte {
 
 struct ServeSvelteInner {
     handle: SvelteServerHandle,
-    client_layer: ServeDir,
-    static_layer: ServeDir,
-    prerendered_layer: ServeDir,
+
+    client_path: PathBuf,
+    static_path: PathBuf,
+    prerendered_path: PathBuf,
+
     config: ServeSvelteConfig,
     state: ServeSvelteState,
 }
@@ -62,17 +77,11 @@ impl ServeSvelte {
         Ok(Self {
             inner: Arc::new(ServeSvelteInner {
                 handle,
-                //
-                client_layer: ServeDir::new(client_path)
-                    .precompressed_gzip()
-                    .precompressed_br(),
-                static_layer: ServeDir::new(static_path)
-                    .precompressed_gzip()
-                    .precompressed_br(),
-                prerendered_layer: ServeDir::new(prerendered_path)
-                    .precompressed_gzip()
-                    .precompressed_br(),
-                //
+
+                client_path,
+                static_path,
+                prerendered_path,
+
                 state,
                 config,
             }),
@@ -81,30 +90,119 @@ impl ServeSvelte {
 }
 
 impl ServeSvelte {
-    async fn try_serve_with(parts: Parts, layer: &mut ServeDir) -> Option<Response<Body>> {
-        let request = Request::from_parts(parts, Empty::<Bytes>::new());
+    fn build_and_validate_path(base_path: &Path, requested_path: &str) -> Option<PathBuf> {
+        let path = requested_path.trim_start_matches('/');
 
-        // Try and serve with the layer
-        let cr = match layer.call(request).await {
+        let path_decoded = percent_decode(path.as_ref()).decode_utf8().ok()?;
+        let path_decoded = Path::new(&*path_decoded);
+
+        let mut path_to_file = base_path.to_path_buf();
+        for component in path_decoded.components() {
+            match component {
+                Component::Normal(comp) => {
+                    // protect against paths like `/foo/c:/bar/baz` (#204)
+                    if Path::new(&comp)
+                        .components()
+                        .all(|c| matches!(c, Component::Normal(_)))
+                    {
+                        path_to_file.push(comp)
+                    } else {
+                        return None;
+                    }
+                }
+                Component::CurDir => {}
+                Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                    return None;
+                }
+            }
+        }
+        Some(path_to_file)
+    }
+
+    async fn try_serve_from_path(
+        parts: &Parts,
+        settings: &OpenFileSettings,
+        base: &Path,
+    ) -> Option<Response<Body>> {
+        let path_to_file = Self::build_and_validate_path(base, parts.uri.path())?;
+
+        let outcome = match open_file(settings, path_to_file, parts).await {
             Ok(value) => value,
-            Err(err) => match err {},
+            Err(err) => {
+                #[cfg(unix)]
+                // 20 = libc::ENOTDIR => "not a directory
+                // when `io_error_more` landed, this can be changed
+                // to checking for `io::ErrorKind::NotADirectory`.
+                // https://github.com/rust-lang/rust/issues/86442
+                let error_is_not_a_directory = err.raw_os_error() == Some(20);
+                #[cfg(not(unix))]
+                let error_is_not_a_directory = false;
+
+                return if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) || error_is_not_a_directory
+                {
+                    None
+                } else {
+                    Some(response_with_status(StatusCode::INTERNAL_SERVER_ERROR))
+                };
+            }
         };
 
-        // Got a not found response
-        if cr.status() == StatusCode::NOT_FOUND {
-            return None;
-        }
+        match outcome {
+            OpenFileOutput::FileOpened(file_output) => Some(build_response(*file_output)),
 
-        Some(cr.map(Body::new))
+            OpenFileOutput::Redirect { location } => {
+                let mut res = response_with_status(StatusCode::TEMPORARY_REDIRECT);
+                res.headers_mut().insert(http::header::LOCATION, location);
+                Some(res)
+            }
+
+            OpenFileOutput::FileNotFound => None,
+            OpenFileOutput::PreconditionFailed => {
+                Some(response_with_status(StatusCode::PRECONDITION_FAILED))
+            }
+
+            OpenFileOutput::NotModified => Some(response_with_status(StatusCode::NOT_MODIFIED)),
+            OpenFileOutput::InvalidRedirectUri => {
+                Some(response_with_status(StatusCode::INTERNAL_SERVER_ERROR))
+            }
+        }
     }
 
     async fn try_serve_static(parts: &Parts, this: &ServeSvelteInner) -> Option<Response<Body>> {
         let request_path = parts.uri.path();
+        let if_unmodified_since = parts
+            .headers
+            .get(header::IF_UNMODIFIED_SINCE)
+            .and_then(IfUnmodifiedSince::from_header_value);
+
+        let if_modified_since = parts
+            .headers
+            .get(header::IF_MODIFIED_SINCE)
+            .and_then(IfModifiedSince::from_header_value);
+
+        let buf_chunk_size = DEFAULT_CAPACITY;
+        // let buf_chunk_size = self.buf_chunk_size;
+        let range_header = parts
+            .headers
+            .get(header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .map(|s| s.to_owned());
+
+        let negotiated_encodings: Vec<_> = encodings(&parts.headers).collect();
+
+        let settings = OpenFileSettings {
+            if_unmodified_since,
+            if_modified_since,
+            negotiated_encodings,
+            range_header,
+            buf_chunk_size,
+        };
 
         // Try serve client
-        if let Some(mut cr) =
-            Self::try_serve_with(parts.clone(), &mut this.client_layer.clone()).await
-        {
+        if let Some(mut cr) = Self::try_serve_from_path(parts, &settings, &this.client_path).await {
             // For successful requests within the immutable path include the immutable cache control header
             if cr.status().is_success() && request_path.starts_with(&this.state.immutable_path) {
                 let headers = cr.headers_mut();
@@ -119,18 +217,17 @@ impl ServeSvelte {
         }
 
         // Try serve static
-        if let Some(cr) = Self::try_serve_with(parts.clone(), &mut this.static_layer.clone()).await
-        {
+        if let Some(cr) = Self::try_serve_from_path(parts, &settings, &this.static_path).await {
             println!("served from static");
             return Some(cr);
         }
 
         // Serve pre-rendered content
         if this.state.prerendered.contains(request_path) {
-            let mut prerendered_layer = this.prerendered_layer.clone();
-
             // Try serve static
-            if let Some(cr) = Self::try_serve_with(parts.clone(), &mut prerendered_layer).await {
+            if let Some(cr) =
+                Self::try_serve_from_path(parts, &settings, &this.prerendered_path).await
+            {
                 println!("served from prerendered");
                 return Some(cr);
             }
@@ -149,7 +246,9 @@ impl ServeSvelte {
             parts.uri = uri;
 
             // Try serve static
-            if let Some(cr) = Self::try_serve_with(parts, &mut prerendered_layer).await {
+            if let Some(cr) =
+                Self::try_serve_from_path(&parts, &settings, &this.prerendered_path).await
+            {
                 println!("served from prerendered (.html)");
                 return Some(cr);
             }
@@ -208,6 +307,7 @@ impl Service<Request<Body>> for ServeSvelte {
             let response = match dynamic_serve(&this.handle, url, req).await {
                 Ok(value) => value,
                 Err(error) => {
+                    println!("{error:?}");
                     // Unable to handle request
                     return Ok(Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -232,6 +332,7 @@ async fn dynamic_serve(
     req: Request<Body>,
 ) -> anyhow::Result<Response<Body>> {
     let (parts, body) = req.into_parts();
+    println!("{parts:?}");
 
     let method = parts.method;
 
@@ -245,14 +346,14 @@ async fn dynamic_serve(
 
     let method_string = method.to_string();
     let body = match method {
-        Method::GET | Method::HEAD => {
+        Method::GET | Method::HEAD => None,
+        _ => {
             // Read the request body
             let body = body.collect().await?;
             let body = body.to_bytes();
 
             Some(body)
         }
-        _ => None,
     };
 
     let request = HttpRequest {
@@ -275,3 +376,139 @@ async fn dynamic_serve(
 
     Ok(http_response)
 }
+
+fn response_with_status(status: StatusCode) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .body(empty_body())
+        .unwrap()
+}
+
+fn body_from_bytes(bytes: Bytes) -> Body {
+    let body = Full::from(bytes).map_err(|err| match err {}).boxed_unsync();
+    Body::new(UnsyncBoxBody::new(body))
+}
+
+fn empty_body() -> Body {
+    let body = Empty::new().map_err(|err| match err {}).boxed_unsync();
+    Body::new(UnsyncBoxBody::new(body))
+}
+
+fn build_response(output: FileOpened) -> Response<Body> {
+    let (maybe_file, size) = match output.extent {
+        FileRequestExtent::Full(file, meta) => (Some(file), meta.len()),
+        FileRequestExtent::Head(meta) => (None, meta.len()),
+    };
+
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, output.mime_header_value)
+        .header(header::ACCEPT_RANGES, "bytes");
+
+    if let Some(encoding) = output
+        .maybe_encoding
+        .filter(|encoding| *encoding != Encoding::Identity)
+    {
+        builder = builder.header(header::CONTENT_ENCODING, encoding.into_header_value());
+    }
+
+    if let Some(last_modified) = output.last_modified {
+        builder = builder.header(header::LAST_MODIFIED, last_modified.0.to_string());
+    }
+
+    match output.maybe_range {
+        Some(Ok(ranges)) => {
+            if let Some(range) = ranges.first() {
+                if ranges.len() > 1 {
+                    builder
+                        .header(header::CONTENT_RANGE, format!("bytes */{}", size))
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .body(body_from_bytes(Bytes::from(
+                            "Cannot serve multipart range requests",
+                        )))
+                        .unwrap()
+                } else {
+                    let body = if let Some(file) = maybe_file {
+                        let range_size = range.end() - range.start() + 1;
+                        Body::new(UnsyncBoxBody::new(
+                            AsyncReadBody::with_capacity_limited(
+                                file,
+                                output.chunk_size,
+                                range_size,
+                            )
+                            .boxed_unsync(),
+                        ))
+                    } else {
+                        empty_body()
+                    };
+
+                    let content_length = if size == 0 {
+                        0
+                    } else {
+                        range.end() - range.start() + 1
+                    };
+
+                    builder
+                        .header(
+                            header::CONTENT_RANGE,
+                            format!("bytes {}-{}/{}", range.start(), range.end(), size),
+                        )
+                        .header(header::CONTENT_LENGTH, content_length)
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .body(body)
+                        .unwrap()
+                }
+            } else {
+                builder
+                    .header(header::CONTENT_RANGE, format!("bytes */{}", size))
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .body(body_from_bytes(Bytes::from(
+                        "No range found after parsing range header, please file an issue",
+                    )))
+                    .unwrap()
+            }
+        }
+
+        Some(Err(_)) => builder
+            .header(header::CONTENT_RANGE, format!("bytes */{}", size))
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .body(empty_body())
+            .unwrap(),
+
+        // Not a range request
+        None => {
+            let body = if let Some(file) = maybe_file {
+                Body::new(UnsyncBoxBody::new(
+                    AsyncReadBody::with_capacity(file, output.chunk_size).boxed_unsync(),
+                ))
+            } else {
+                empty_body()
+            };
+
+            builder
+                .header(header::CONTENT_LENGTH, size.to_string())
+                .body(body)
+                .unwrap()
+        }
+    }
+}
+
+/*
+       let future = self
+            .try_call(req)
+            .map(|result: Result<_, _>| -> Result<_, Infallible> {
+                let response = result.unwrap_or_else(|err| {
+                    tracing::error!(error = %err, "Failed to read file");
+
+                    let body = ResponseBody::new(UnsyncBoxBody::new(
+                        Empty::new().map_err(|err| match err {}).boxed_unsync(),
+                    ));
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(body)
+                        .unwrap()
+                });
+                Ok(response)
+            } as _);
+
+        InfallibleResponseFuture::new(future)
+*/
