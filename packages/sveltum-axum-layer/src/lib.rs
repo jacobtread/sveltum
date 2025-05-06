@@ -52,7 +52,6 @@ struct ServeSvelteInner {
 
     config: ServeSvelteConfig,
     state: ServeSvelteState,
-    buf_chunk_size: usize,
 }
 
 struct ServeSvelteState {
@@ -61,17 +60,30 @@ struct ServeSvelteState {
 }
 
 pub struct ServeSvelteConfig {
-    pub server_path: PathBuf,
     pub origin: Option<String>,
+    pub buf_chunk_size: usize,
+}
+
+impl Default for ServeSvelteConfig {
+    fn default() -> Self {
+        Self {
+            origin: None,
+            buf_chunk_size: DEFAULT_CAPACITY,
+        }
+    }
 }
 
 impl ServeSvelte {
-    pub async fn create(config: ServeSvelteConfig) -> anyhow::Result<Self> {
-        let (response, handle) = SvelteServerRuntime::create(config.server_path.clone()).await?;
+    pub async fn create(server_path: PathBuf, config: ServeSvelteConfig) -> anyhow::Result<Self> {
+        // Build the paths that we serve from
+        let client_path = server_path.join("client");
+        let static_path = server_path.join("static");
+        let prerendered_path = server_path.join("prerendered");
 
-        let client_path = config.server_path.join("client");
-        let static_path = config.server_path.join("static");
-        let prerendered_path = config.server_path.join("prerendered");
+        // Start the runtime that will handle dynamic requests
+        let (response, handle) = SvelteServerRuntime::create(server_path).await?;
+
+        // Determine the immutable assets path
         let immutable_path = format!("{}/immutable", response.app_path);
 
         let state = ServeSvelteState {
@@ -89,7 +101,6 @@ impl ServeSvelte {
 
                 state,
                 config,
-                buf_chunk_size: DEFAULT_CAPACITY,
             }),
         })
     }
@@ -271,7 +282,7 @@ fn get_file_request_options(parts: &Parts, this: &ServeSvelteInner) -> FileReque
         .and_then(|value| value.to_str().ok())
         .map(|s| s.to_owned());
 
-    let buf_chunk_size = this.buf_chunk_size;
+    let buf_chunk_size = this.config.buf_chunk_size;
 
     // Collect allowed encodings from the headers
     let mut negotiated_encodings: Vec<(Encoding, QValue)> = encodings(&parts.headers)
