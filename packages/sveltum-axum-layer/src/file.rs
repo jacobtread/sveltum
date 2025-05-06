@@ -15,9 +15,8 @@ pub async fn try_open_file(
         return Ok((None, meta, maybe_encoding));
     }
 
-    let (file, maybe_encoding) =
+    let (file, meta, maybe_encoding) =
         open_file_with_fallback(path_to_file, negotiated_encodings).await?;
-    let meta = file.metadata().await?;
     Ok((Some(file), meta, maybe_encoding))
 }
 
@@ -41,7 +40,7 @@ fn apply_file_extension(path: &mut PathBuf, file_extension: &'static std::ffi::O
 async fn open_file_with_fallback(
     mut path: PathBuf,
     negotiated_encodings: &[Encoding],
-) -> io::Result<(File, Option<Encoding>)> {
+) -> io::Result<(File, Metadata, Option<Encoding>)> {
     let mut encoding_iter = negotiated_encodings.iter();
 
     let (file, encoding) = loop {
@@ -68,7 +67,8 @@ async fn open_file_with_fallback(
         }
     };
 
-    Ok((file, encoding))
+    let meta = file.metadata().await?;
+    Ok((file, meta, encoding))
 }
 
 // Attempts to get the file metadata with any of the possible negotiated_encodings in the

@@ -1,9 +1,8 @@
-//! File system related services.
+//! Modified version of https://github.com/tower-rs/tower-http/blob/main/tower-http/src/services/fs/mod.rs
 
 use bytes::Bytes;
 use futures_util::Stream;
 use http_body::{Body, Frame};
-use pin_project_lite::pin_project;
 use std::{
     io,
     pin::Pin,
@@ -12,14 +11,9 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, Take};
 use tokio_util::io::ReaderStream;
 
-pin_project! {
-    // NOTE: This could potentially be upstreamed to `http-body`.
-    /// Adapter that turns an [`impl AsyncRead`][tokio::io::AsyncRead] to an [`impl Body`][http_body::Body].
-    #[derive(Debug)]
-    pub struct AsyncReadBody<T> {
-        #[pin]
-        reader: ReaderStream<T>,
-    }
+#[derive(Debug)]
+pub struct AsyncReadBody<T> {
+    reader: ReaderStream<T>,
 }
 
 impl<T> AsyncReadBody<T>
@@ -56,7 +50,10 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match std::task::ready!(self.project().reader.poll_next(cx)) {
+        // Safety: We only project to `reader`, which is a pinned field.
+        let reader = unsafe { self.map_unchecked_mut(|s| &mut s.reader) };
+
+        match std::task::ready!(reader.poll_next(cx)) {
             Some(Ok(chunk)) => Poll::Ready(Some(Ok(Frame::data(chunk)))),
             Some(Err(err)) => Poll::Ready(Some(Err(err))),
             None => Poll::Ready(None),

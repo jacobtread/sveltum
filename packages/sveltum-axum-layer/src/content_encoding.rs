@@ -1,3 +1,30 @@
+//! Modified version of https://github.com/tower-rs/tower-http/blob/main/tower-http/src/content_encoding.rs
+
+// based on https://github.com/http-rs/accept-encoding
+pub fn encodings(headers: &http::HeaderMap) -> impl Iterator<Item = (Encoding, QValue)> + '_ {
+    headers
+        .get_all(http::header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|hval| hval.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .filter_map(move |v| {
+            let mut v = v.splitn(2, ';');
+
+            let encoding = match Encoding::parse(v.next().unwrap().trim()) {
+                Some(encoding) => encoding,
+                None => return None, // ignore unknown encodings
+            };
+
+            let qval = if let Some(qval) = v.next() {
+                QValue::parse(qval.trim())?
+            } else {
+                QValue::one()
+            };
+
+            Some((encoding, qval))
+        })
+}
+
 // This enum's variants are ordered from least to most preferred.
 #[derive(Copy, Clone, Debug, Ord, PartialOrd, PartialEq, Eq)]
 pub(crate) enum Encoding {
@@ -114,31 +141,4 @@ impl QValue {
             factor /= 10;
         }
     }
-}
-
-// based on https://github.com/http-rs/accept-encoding
-pub(crate) fn encodings(
-    headers: &http::HeaderMap,
-) -> impl Iterator<Item = (Encoding, QValue)> + '_ {
-    headers
-        .get_all(http::header::ACCEPT_ENCODING)
-        .iter()
-        .filter_map(|hval| hval.to_str().ok())
-        .flat_map(|s| s.split(','))
-        .filter_map(move |v| {
-            let mut v = v.splitn(2, ';');
-
-            let encoding = match Encoding::parse(v.next().unwrap().trim()) {
-                Some(encoding) => encoding,
-                None => return None, // ignore unknown encodings
-            };
-
-            let qval = if let Some(qval) = v.next() {
-                QValue::parse(qval.trim())?
-            } else {
-                QValue::one()
-            };
-
-            Some((encoding, qval))
-        })
 }

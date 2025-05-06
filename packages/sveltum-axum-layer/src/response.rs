@@ -1,7 +1,7 @@
 use axum_core::body::Body;
 use bytes::Bytes;
 use http::{Response, StatusCode};
-use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, Empty, Full};
 
 pub fn response_with_status(status: StatusCode) -> Response<Body> {
     Response::builder()
@@ -11,8 +11,8 @@ pub fn response_with_status(status: StatusCode) -> Response<Body> {
 }
 
 pub fn body_from_bytes(bytes: Bytes) -> Body {
-    let body = Full::from(bytes).map_err(|err| match err {}).boxed_unsync();
-    Body::new(UnsyncBoxBody::new(body))
+    let body = Full::from(bytes).map_err(|err| match err {});
+    Body::new(body)
 }
 
 pub fn body_from_message(message: &'static str) -> Body {
@@ -20,6 +20,6 @@ pub fn body_from_message(message: &'static str) -> Body {
 }
 
 pub fn empty_body() -> Body {
-    let body = Empty::new().map_err(|err| match err {}).boxed_unsync();
-    Body::new(UnsyncBoxBody::new(body))
+    let body = Empty::new().map_err(|err| match err {});
+    Body::new(body)
 }
