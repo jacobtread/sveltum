@@ -10,7 +10,7 @@ pub fn encodings(headers: &http::HeaderMap) -> impl Iterator<Item = (Encoding, Q
         .filter_map(move |v| {
             let mut v = v.splitn(2, ';');
 
-            let encoding = match Encoding::parse(v.next().unwrap().trim()) {
+            let encoding = match Encoding::parse(v.next()?.trim()) {
                 Some(encoding) => encoding,
                 None => return None, // ignore unknown encodings
             };

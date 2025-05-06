@@ -287,7 +287,7 @@ async fn try_serve_from_path(
     let mime = mime_guess::from_path(&path_to_file)
         .first_raw()
         .map(HeaderValue::from_static)
-        .unwrap_or_else(|| HeaderValue::from_str(mime::APPLICATION_OCTET_STREAM.as_ref()).unwrap());
+        .unwrap_or_else(|| HeaderValue::from_static(mime::APPLICATION_OCTET_STREAM.as_ref()));
 
     let (maybe_file, meta, maybe_encoding) = match try_open_file(
         path_to_file,
