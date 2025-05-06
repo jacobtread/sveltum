@@ -4,20 +4,6 @@ use tokio::fs::File;
 
 use crate::Encoding;
 
-// Modify the `path` to add the provided `file_extension`
-fn apply_file_extension(path: &mut PathBuf, file_extension: &'static std::ffi::OsStr) {
-    let new_file_name = path
-        .file_name()
-        .map(|file_name| {
-            let mut os_string = file_name.to_os_string();
-            os_string.push(file_extension);
-            os_string
-        })
-        .unwrap_or_else(|| file_extension.to_os_string());
-
-    path.set_file_name(new_file_name);
-}
-
 pub async fn try_open_file(
     path_to_file: PathBuf,
     negotiated_encodings: &[Encoding],
@@ -35,10 +21,24 @@ pub async fn try_open_file(
     Ok((Some(file), meta, maybe_encoding))
 }
 
+// Modify the `path` to add the provided `file_extension`
+fn apply_file_extension(path: &mut PathBuf, file_extension: &'static std::ffi::OsStr) {
+    let new_file_name = path
+        .file_name()
+        .map(|file_name| {
+            let mut os_string = file_name.to_os_string();
+            os_string.push(file_extension);
+            os_string
+        })
+        .unwrap_or_else(|| file_extension.to_os_string());
+
+    path.set_file_name(new_file_name);
+}
+
 // Attempts to open the file with any of the possible negotiated_encodings in the
 // preferred order. If none of the negotiated_encodings have a corresponding precompressed
 // file the uncompressed file is used as a fallback.
-pub async fn open_file_with_fallback(
+async fn open_file_with_fallback(
     mut path: PathBuf,
     negotiated_encodings: &[Encoding],
 ) -> io::Result<(File, Option<Encoding>)> {

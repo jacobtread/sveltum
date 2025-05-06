@@ -15,6 +15,10 @@ pub fn body_from_bytes(bytes: Bytes) -> Body {
     Body::new(UnsyncBoxBody::new(body))
 }
 
+pub fn body_from_message(message: &'static str) -> Body {
+    body_from_bytes(Bytes::from(message))
+}
+
 pub fn empty_body() -> Body {
     let body = Empty::new().map_err(|err| match err {}).boxed_unsync();
     Body::new(UnsyncBoxBody::new(body))

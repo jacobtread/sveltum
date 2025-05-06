@@ -2,11 +2,10 @@ use self::{
     async_read_body::AsyncReadBody,
     content_encoding::{Encoding, encodings},
 };
-use bytes::Bytes;
 use file::try_open_file;
 use headers::{IfModifiedSince, IfUnmodifiedSince, LastModified, try_parse_range};
 use percent_encoding::percent_decode;
-use response::{body_from_bytes, empty_body, response_with_status};
+use response::{body_from_message, empty_body, response_with_status};
 use std::{
     collections::HashSet,
     convert::Infallible,
@@ -120,19 +119,7 @@ impl Service<Request<Body>> for ServeSvelte {
             }
 
             // Derive origin early to save on needing to clone the configuration
-            let url = match this
-                .config
-                .origin
-                .as_deref()
-                .or_else(|| {
-                    // Attempt to extract the origin from the header
-                    parts
-                        .headers
-                        .get(header::ORIGIN)
-                        .and_then(|origin| origin.to_str().ok())
-                })
-                .map(|origin| format!("{}{}", origin, &parts.uri))
-            {
+            let url = match get_request_url(&parts, &this.config) {
                 Some(url) => url,
                 None => {
                     // Unable to determine origin
@@ -190,6 +177,20 @@ impl Service<Request<Body>> for ServeSvelte {
             Ok(response)
         })
     }
+}
+
+fn get_request_url(parts: &Parts, config: &ServeSvelteConfig) -> Option<String> {
+    config
+        .origin
+        .as_deref()
+        .or_else(|| {
+            // Attempt to extract the origin from the header
+            parts
+                .headers
+                .get(header::ORIGIN)
+                .and_then(|origin| origin.to_str().ok())
+        })
+        .map(|origin| format!("{}{}", origin, &parts.uri))
 }
 
 /// Translate HTTP request parts and body into a [HttpRequest] that can
@@ -435,11 +436,62 @@ async fn try_serve_from_path(
         }
     }
 
-    let maybe_range = try_parse_range(settings.range_header.as_deref(), size);
-
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, mime)
         .header(header::ACCEPT_RANGES, "bytes");
+
+    let maybe_ranges = try_parse_range(settings.range_header.as_deref(), size).transpose();
+    let maybe_range = match &maybe_ranges {
+        // Has only one range
+        Ok(Some(ranges)) => {
+            let count = ranges.len();
+
+            // Has more than one range (Only one range is supported)
+            if count > 1 {
+                return Some(
+                    builder
+                        .header(header::CONTENT_RANGE, format!("bytes */{}", size))
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .body(body_from_message("Cannot serve multipart range requests"))
+                        .unwrap(),
+                );
+            }
+
+            let range = ranges.first();
+            let range = match range {
+                Some(value) => value,
+                // Has no ranges
+                None => {
+                    return Some(
+                        builder
+                            .header(header::CONTENT_RANGE, format!("bytes */{}", size))
+                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                            .body(body_from_message(
+                                "No range found after parsing range header, please file an issue",
+                            ))
+                            .unwrap(),
+                    );
+                }
+            };
+
+            // Exactly one range
+            Some(range)
+        }
+
+        // Has invalid range header
+        Err(_) => {
+            return Some(
+                builder
+                    .header(header::CONTENT_RANGE, format!("bytes */{}", size))
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .body(empty_body())
+                    .unwrap(),
+            );
+        }
+
+        // No range
+        _ => None,
+    };
 
     if let Some(encoding) = maybe_encoding.filter(|encoding| *encoding != Encoding::Identity) {
         builder = builder.header(header::CONTENT_ENCODING, encoding.into_header_value());
@@ -450,16 +502,7 @@ async fn try_serve_from_path(
     }
 
     match maybe_range {
-        // Invalid range
-        Some(Err(_)) => Some(
-            builder
-                .header(header::CONTENT_RANGE, format!("bytes */{}", size))
-                .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                .body(empty_body())
-                .unwrap(),
-        ),
-
-        // Not a range request
+        // Not a range request (Entire file)
         None => {
             let body = if let Some(file) = maybe_file {
                 Body::new(UnsyncBoxBody::new(
@@ -477,68 +520,37 @@ async fn try_serve_from_path(
             )
         }
 
-        // Valid range
-        Some(Ok(ranges)) => {
-            if let Some(range) = ranges.first() {
-                // if there is any other amount of ranges than 1 we'll return an
-                // unsatisfiable later as there isn't yet support for multipart ranges
-                if ranges.len() > 1 {
-                    return Some(
-                        builder
-                            .header(header::CONTENT_RANGE, format!("bytes */{}", size))
-                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                            .body(body_from_bytes(Bytes::from(
-                                "Cannot serve multipart range requests",
-                            )))
-                            .unwrap(),
-                    );
+        Some(range) => {
+            let body = if let Some(mut file) = maybe_file {
+                // Seek to the desired start of the range within the file
+                if let Err(_err) = file.seek(SeekFrom::Start(*range.start())).await {
+                    return Some(response_with_status(StatusCode::INTERNAL_SERVER_ERROR));
                 }
 
-                let body = if let Some(mut file) = maybe_file {
-                    // Seek to the desired start of the range within the file
-                    if let Err(_err) = file.seek(SeekFrom::Start(*ranges[0].start())).await {
-                        return Some(response_with_status(StatusCode::INTERNAL_SERVER_ERROR));
-                    }
-
-                    let range_size = range.end() - range.start() + 1;
-                    Body::new(UnsyncBoxBody::new(
-                        AsyncReadBody::with_capacity_limited(
-                            file,
-                            settings.buf_chunk_size,
-                            range_size,
-                        )
+                let range_size = range.end() - range.start() + 1;
+                Body::new(UnsyncBoxBody::new(
+                    AsyncReadBody::with_capacity_limited(file, settings.buf_chunk_size, range_size)
                         .boxed_unsync(),
-                    ))
-                } else {
-                    empty_body()
-                };
+                ))
+            } else {
+                empty_body()
+            };
 
-                let content_length = if size == 0 {
-                    0
-                } else {
-                    range.end() - range.start() + 1
-                };
-
-                return Some(
-                    builder
-                        .header(
-                            header::CONTENT_RANGE,
-                            format!("bytes {}-{}/{}", range.start(), range.end(), size),
-                        )
-                        .header(header::CONTENT_LENGTH, content_length)
-                        .status(StatusCode::PARTIAL_CONTENT)
-                        .body(body)
-                        .unwrap(),
-                );
-            }
+            let content_length = if size == 0 {
+                0
+            } else {
+                range.end() - range.start() + 1
+            };
 
             Some(
                 builder
-                    .header(header::CONTENT_RANGE, format!("bytes */{}", size))
-                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                    .body(body_from_bytes(Bytes::from(
-                        "No range found after parsing range header, please file an issue",
-                    )))
+                    .header(
+                        header::CONTENT_RANGE,
+                        format!("bytes {}-{}/{}", range.start(), range.end(), size),
+                    )
+                    .header(header::CONTENT_LENGTH, content_length)
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .body(body)
                     .unwrap(),
             )
         }
