@@ -65,7 +65,7 @@ impl SvelteServerRuntime {
             let main_module_path = server_path.join("index.js");
             let main_module = match ModuleSpecifier::from_file_path(main_module_path) {
                 Ok(value) => value,
-                Err(err) => {
+                Err(_) => {
                     _ = init_tx.send(Err(anyhow::Error::msg("invalid main module path")));
                     return;
                 }

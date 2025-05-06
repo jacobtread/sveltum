@@ -3,7 +3,7 @@ use crate::{
     async_read_body::AsyncReadBody,
     content_encoding::QValue,
     encodings,
-    file::try_open_file,
+    file::{file_metadata_with_fallback, open_file_with_fallback},
     headers::{IfModifiedSince, IfUnmodifiedSince, LastModified, try_parse_range},
     response::{body_from_bytes, body_from_message, empty_body, response_with_status},
 };
@@ -289,13 +289,16 @@ async fn try_serve_from_path(
         .map(HeaderValue::from_static)
         .unwrap_or_else(|| HeaderValue::from_static(mime::APPLICATION_OCTET_STREAM.as_ref()));
 
-    let (maybe_file, meta, maybe_encoding) = match try_open_file(
-        path_to_file,
-        &settings.negotiated_encodings,
-        parts.method == Method::HEAD,
-    )
-    .await
-    {
+    let result = match parts.method {
+        Method::HEAD => file_metadata_with_fallback(path_to_file, &settings.negotiated_encodings)
+            .await
+            .map(|(meta, maybe_encoding)| (None, meta, maybe_encoding)),
+        _ => open_file_with_fallback(path_to_file, &settings.negotiated_encodings)
+            .await
+            .map(|(file, meta, maybe_encoding)| (Some(file), meta, maybe_encoding)),
+    };
+
+    let (maybe_file, meta, maybe_encoding) = match result {
         Ok(value) => value,
         Err(err) => {
             #[cfg(unix)]
