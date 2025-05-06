@@ -3,8 +3,10 @@ use self::{
     content_encoding::{Encoding, encodings},
 };
 use bytes::Bytes;
-use headers::{IfModifiedSince, IfUnmodifiedSince, LastModified};
+use file::try_open_file;
+use headers::{IfModifiedSince, IfUnmodifiedSince, LastModified, try_parse_range};
 use percent_encoding::percent_decode;
+use response::{body_from_bytes, empty_body, response_with_status};
 use std::{
     collections::HashSet,
     convert::Infallible,
@@ -21,19 +23,18 @@ use crate::content_encoding::QValue;
 use axum_core::body::Body;
 use http::HeaderValue;
 use http::{HeaderName, Method, Request, Response, StatusCode, Uri, header, request::Parts};
-use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
-use http_range_header::RangeUnsatisfiableError;
-use std::{ffi::OsStr, fs::Metadata, ops::RangeInclusive};
+use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use sveltum::{
-    core::HttpRequest,
+    core::{HttpRequest, HttpResponse},
     runtime::{SvelteServerHandle, SvelteServerRuntime},
 };
-use tokio::fs::File;
 use tower_service::Service;
 
 mod async_read_body;
 mod content_encoding;
+mod file;
 mod headers;
+mod response;
 
 // default capacity 64KiB
 const DEFAULT_CAPACITY: usize = 65536;
@@ -52,6 +53,7 @@ struct ServeSvelteInner {
 
     config: ServeSvelteConfig,
     state: ServeSvelteState,
+    buf_chunk_size: usize,
 }
 
 struct ServeSvelteState {
@@ -88,6 +90,7 @@ impl ServeSvelte {
 
                 state,
                 config,
+                buf_chunk_size: DEFAULT_CAPACITY,
             }),
         })
     }
@@ -116,16 +119,19 @@ impl Service<Request<Body>> for ServeSvelte {
                 }
             }
 
-            // Rebuild original request
-            let req = Request::from_parts(parts, body);
-
             // Derive origin early to save on needing to clone the configuration
             let url = match this
                 .config
                 .origin
                 .as_deref()
-                .or_else(|| get_request_origin(&req))
-                .map(|origin| format!("{}{}", origin, req.uri()))
+                .or_else(|| {
+                    // Attempt to extract the origin from the header
+                    parts
+                        .headers
+                        .get(header::ORIGIN)
+                        .and_then(|origin| origin.to_str().ok())
+                })
+                .map(|origin| format!("{}{}", origin, &parts.uri))
             {
                 Some(url) => url,
                 None => {
@@ -137,12 +143,42 @@ impl Service<Request<Body>> for ServeSvelte {
                 }
             };
 
-            // Handle the request with a dynamic handler
-            println!("served from dynamic");
-            let response = match dynamic_serve(&this.handle, url, req).await {
+            tracing::debug!("serving from dynamic route");
+
+            // Create the dynamic request
+            let request = match create_dynamic_request(parts, url, body).await {
                 Ok(value) => value,
-                Err(error) => {
-                    println!("{error:?}");
+                Err(cause) => {
+                    tracing::error!(?cause, "failed to create dynamic request");
+
+                    // Unable to handle request
+                    return Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::empty())
+                        .expect("creating a response with an empty body will never fail"));
+                }
+            };
+
+            // Handle the request with a dynamic handler
+            let response = match this.handle.request(request).await {
+                Ok(value) => value,
+                Err(cause) => {
+                    tracing::error!(?cause, "failed to handle dynamic request");
+
+                    // Unable to handle request
+                    return Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::empty())
+                        .expect("creating a response with an empty body will never fail"));
+                }
+            };
+
+            // Convert the response into an http compatible one
+            let response = match create_dynamic_response(response) {
+                Ok(value) => value,
+                Err(cause) => {
+                    tracing::error!(?cause, "failed to create dynamic route response");
+
                     // Unable to handle request
                     return Ok(Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -156,31 +192,26 @@ impl Service<Request<Body>> for ServeSvelte {
     }
 }
 
-fn get_request_origin(req: &Request<Body>) -> Option<&str> {
-    let origin = req.headers().get(header::ORIGIN)?;
-    origin.to_str().ok()
-}
-
-async fn dynamic_serve(
-    handle: &SvelteServerHandle,
+/// Translate HTTP request parts and body into a [HttpRequest] that can
+/// be processed
+async fn create_dynamic_request(
+    parts: Parts,
     url: String,
-    req: Request<Body>,
-) -> anyhow::Result<Response<Body>> {
-    let (parts, body) = req.into_parts();
-    println!("{parts:?}");
-
-    let method = parts.method;
-
+    body: Body,
+) -> anyhow::Result<HttpRequest> {
     // Collect headers from incoming request
     let request_headers = parts.headers;
-    let mut headers = Vec::with_capacity(request_headers.len());
 
+    // Create collection of headers
+    let mut headers = Vec::with_capacity(request_headers.len());
     for (key, value) in request_headers.iter() {
         headers.push((key.to_string(), value.to_str()?.to_string()));
     }
 
-    let method_string = method.to_string();
-    let body = match method {
+    let method_string = parts.method.to_string();
+
+    // Read body for requests that can have
+    let body = match parts.method {
         Method::GET | Method::HEAD => None,
         _ => {
             // Read the request body
@@ -191,14 +222,16 @@ async fn dynamic_serve(
         }
     };
 
-    let request = HttpRequest {
+    Ok(HttpRequest {
         url,
         method: method_string,
         headers,
         body,
-    };
+    })
+}
 
-    let response = handle.request(request).await?;
+/// Convert a dynamic response into a http response
+fn create_dynamic_response(response: HttpResponse) -> anyhow::Result<Response<Body>> {
     let mut http_response = Response::builder().status(StatusCode::from_u16(response.status)?);
 
     for (name, value) in response.headers {
@@ -212,115 +245,15 @@ async fn dynamic_serve(
     Ok(http_response)
 }
 
-fn response_with_status(status: StatusCode) -> Response<Body> {
-    Response::builder()
-        .status(status)
-        .body(empty_body())
-        .unwrap()
+struct FileRequestOptions {
+    if_unmodified_since: Option<IfUnmodifiedSince>,
+    if_modified_since: Option<IfModifiedSince>,
+    range_header: Option<String>,
+    negotiated_encodings: Vec<Encoding>,
+    buf_chunk_size: usize,
 }
 
-fn body_from_bytes(bytes: Bytes) -> Body {
-    let body = Full::from(bytes).map_err(|err| match err {}).boxed_unsync();
-    Body::new(UnsyncBoxBody::new(body))
-}
-
-fn empty_body() -> Body {
-    let body = Empty::new().map_err(|err| match err {}).boxed_unsync();
-    Body::new(UnsyncBoxBody::new(body))
-}
-
-/*
-       let future = self
-            .try_call(req)
-            .map(|result: Result<_, _>| -> Result<_, Infallible> {
-                let response = result.unwrap_or_else(|err| {
-                    tracing::error!(error = %err, "Failed to read file");
-
-                    let body = ResponseBody::new(UnsyncBoxBody::new(
-                        Empty::new().map_err(|err| match err {}).boxed_unsync(),
-                    ));
-                    Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(body)
-                        .unwrap()
-                });
-                Ok(response)
-            } as _);
-
-        InfallibleResponseFuture::new(future)
-*/
-
-async fn is_dir(path_to_file: &Path) -> bool {
-    tokio::fs::metadata(path_to_file)
-        .await
-        .is_ok_and(|meta_data| meta_data.is_dir())
-}
-
-fn append_slash_on_path(uri: Uri) -> Result<Uri, http::Error> {
-    let http::uri::Parts {
-        scheme,
-        authority,
-        path_and_query,
-        ..
-    } = uri.into_parts();
-
-    let mut uri_builder = Uri::builder();
-
-    if let Some(scheme) = scheme {
-        uri_builder = uri_builder.scheme(scheme);
-    }
-
-    if let Some(authority) = authority {
-        uri_builder = uri_builder.authority(authority);
-    }
-
-    let uri_builder = if let Some(path_and_query) = path_and_query {
-        if let Some(query) = path_and_query.query() {
-            uri_builder.path_and_query(format!("{}/?{}", path_and_query.path(), query))
-        } else {
-            uri_builder.path_and_query(format!("{}/", path_and_query.path()))
-        }
-    } else {
-        uri_builder.path_and_query("/")
-    };
-
-    uri_builder.build().map_err(|err| {
-        tracing::error!(?err, "redirect uri failed to build");
-        err
-    })
-}
-
-fn build_and_validate_path(base_path: &Path, requested_path: &str) -> Option<PathBuf> {
-    let path = requested_path.trim_start_matches('/');
-
-    let path_decoded = percent_decode(path.as_ref()).decode_utf8().ok()?;
-    let path_decoded = Path::new(&*path_decoded);
-
-    let mut path_to_file = base_path.to_path_buf();
-    for component in path_decoded.components() {
-        match component {
-            Component::Normal(comp) => {
-                // protect against paths like `/foo/c:/bar/baz` (#204)
-                if Path::new(&comp)
-                    .components()
-                    .all(|c| matches!(c, Component::Normal(_)))
-                {
-                    path_to_file.push(comp)
-                } else {
-                    return None;
-                }
-            }
-            Component::CurDir => {}
-            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
-                return None;
-            }
-        }
-    }
-    Some(path_to_file)
-}
-
-async fn try_serve_static(parts: &Parts, this: &ServeSvelteInner) -> Option<Response<Body>> {
-    let request_path = parts.uri.path();
+fn get_file_request_options(parts: &Parts, this: &ServeSvelteInner) -> FileRequestOptions {
     let if_unmodified_since = parts
         .headers
         .get(header::IF_UNMODIFIED_SINCE)
@@ -331,23 +264,42 @@ async fn try_serve_static(parts: &Parts, this: &ServeSvelteInner) -> Option<Resp
         .get(header::IF_MODIFIED_SINCE)
         .and_then(IfModifiedSince::from_header_value);
 
-    let buf_chunk_size = DEFAULT_CAPACITY;
-    // let buf_chunk_size = self.buf_chunk_size;
     let range_header = parts
         .headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
         .map(|s| s.to_owned());
 
-    let negotiated_encodings: Vec<_> = encodings(&parts.headers).collect();
+    let buf_chunk_size = this.buf_chunk_size;
 
-    let settings = ServeFileOptions {
+    // Collect allowed encodings from the headers
+    let mut negotiated_encodings: Vec<(Encoding, QValue)> = encodings(&parts.headers)
+        // Only filter to "acceptable" types
+        .filter(|(_, value)| value.0 > 0)
+        // Collect encodings
+        .collect();
+
+    // Sort encodings by most preferred (Descending order, highest Q value first)
+    negotiated_encodings.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let negotiated_encodings = negotiated_encodings
+        .into_iter()
+        .map(|value| value.0)
+        .collect();
+
+    FileRequestOptions {
         if_unmodified_since,
         if_modified_since,
         negotiated_encodings,
         range_header,
         buf_chunk_size,
-    };
+    }
+}
+
+async fn try_serve_static(parts: &Parts, this: &ServeSvelteInner) -> Option<Response<Body>> {
+    let request_path = parts.uri.path();
+
+    let settings = get_file_request_options(parts, this);
 
     // Try serve client
     if let Some(mut cr) = try_serve_from_path(parts, &settings, &this.client_path).await {
@@ -360,13 +312,13 @@ async fn try_serve_static(parts: &Parts, this: &ServeSvelteInner) -> Option<Resp
             );
         }
 
-        println!("served from client");
+        tracing::debug!("serving from client path");
         return Some(cr);
     }
 
     // Try serve static
     if let Some(cr) = try_serve_from_path(parts, &settings, &this.static_path).await {
-        println!("served from static");
+        tracing::debug!("serving from static path");
         return Some(cr);
     }
 
@@ -374,7 +326,7 @@ async fn try_serve_static(parts: &Parts, this: &ServeSvelteInner) -> Option<Resp
     if this.state.prerendered.contains(request_path) {
         // Try serve static
         if let Some(cr) = try_serve_from_path(parts, &settings, &this.prerendered_path).await {
-            println!("served from prerendered");
+            tracing::debug!("serving from prerendered path");
             return Some(cr);
         }
 
@@ -393,7 +345,7 @@ async fn try_serve_static(parts: &Parts, this: &ServeSvelteInner) -> Option<Resp
 
         // Try serve static
         if let Some(cr) = try_serve_from_path(&parts, &settings, &this.prerendered_path).await {
-            println!("served from prerendered (.html)");
+            tracing::debug!("serving from prerendered path (html extension)");
             return Some(cr);
         }
     }
@@ -403,24 +355,18 @@ async fn try_serve_static(parts: &Parts, this: &ServeSvelteInner) -> Option<Resp
 
 async fn try_serve_from_path(
     parts: &Parts,
-    settings: &ServeFileOptions,
+    settings: &FileRequestOptions,
     base: &Path,
 ) -> Option<Response<Body>> {
     let mut path_to_file = build_and_validate_path(base, parts.uri.path())?;
 
-    // Might already at this point know a redirect or not found result should be
-    // returned which corresponds to a Some(output). Otherwise the path might be
-    // modified and proceed to the open file/metadata future.
-    if is_dir(&path_to_file).await {
+    if tokio::fs::metadata(&path_to_file)
+        .await
+        .is_ok_and(|meta_data| meta_data.is_dir())
+    {
+        // Cannot serve a directory when referenced by name
         if !parts.uri.path().ends_with('/') {
-            let uri = match append_slash_on_path(parts.uri.clone()) {
-                Ok(uri) => uri,
-                Err(err) => return Some(response_with_status(StatusCode::INTERNAL_SERVER_ERROR)),
-            };
-            let location = HeaderValue::from_str(&uri.to_string()).unwrap();
-            let mut res = response_with_status(StatusCode::TEMPORARY_REDIRECT);
-            res.headers_mut().insert(http::header::LOCATION, location);
-            return Some(res);
+            return None;
         }
 
         // Append index.html searching
@@ -599,115 +545,31 @@ async fn try_serve_from_path(
     }
 }
 
-struct ServeFileOptions {
-    if_unmodified_since: Option<IfUnmodifiedSince>,
-    if_modified_since: Option<IfModifiedSince>,
-    negotiated_encodings: Vec<(Encoding, QValue)>,
-    range_header: Option<String>,
-    buf_chunk_size: usize,
-}
+fn build_and_validate_path(base_path: &Path, requested_path: &str) -> Option<PathBuf> {
+    let path = requested_path.trim_start_matches('/');
 
-async fn try_open_file(
-    path_to_file: PathBuf,
-    negotiated_encodings: &[(Encoding, QValue)],
-    head: bool,
-) -> std::io::Result<(Option<File>, Metadata, Option<Encoding>)> {
-    if head {
-        let (meta, maybe_encoding) =
-            file_metadata_with_fallback(path_to_file, negotiated_encodings.to_vec()).await?;
-        return Ok((None, meta, maybe_encoding));
-    }
+    let path_decoded = percent_decode(path.as_ref()).decode_utf8().ok()?;
+    let path_decoded = Path::new(&*path_decoded);
 
-    let (file, maybe_encoding) =
-        open_file_with_fallback(path_to_file, negotiated_encodings.to_vec()).await?;
-    let meta = file.metadata().await?;
-    Ok((Some(file), meta, maybe_encoding))
-}
-
-// Returns the preferred_encoding encoding and modifies the path extension
-// to the corresponding file extension for the encoding.
-fn preferred_encoding(
-    path: &mut PathBuf,
-    negotiated_encoding: &[(Encoding, QValue)],
-) -> Option<Encoding> {
-    let preferred_encoding = Encoding::preferred_encoding(negotiated_encoding.iter().copied());
-
-    if let Some(file_extension) =
-        preferred_encoding.and_then(|encoding| encoding.to_file_extension())
-    {
-        let new_file_name = path
-            .file_name()
-            .map(|file_name| {
-                let mut os_string = file_name.to_os_string();
-                os_string.push(file_extension);
-                os_string
-            })
-            .unwrap_or_else(|| file_extension.to_os_string());
-
-        path.set_file_name(new_file_name);
-    }
-
-    preferred_encoding
-}
-
-// Attempts to open the file with any of the possible negotiated_encodings in the
-// preferred order. If none of the negotiated_encodings have a corresponding precompressed
-// file the uncompressed file is used as a fallback.
-async fn open_file_with_fallback(
-    mut path: PathBuf,
-    mut negotiated_encoding: Vec<(Encoding, QValue)>,
-) -> io::Result<(File, Option<Encoding>)> {
-    let (file, encoding) = loop {
-        // Get the preferred encoding among the negotiated ones.
-        let encoding = preferred_encoding(&mut path, &negotiated_encoding);
-        match (File::open(&path).await, encoding) {
-            (Ok(file), maybe_encoding) => break (file, maybe_encoding),
-            (Err(err), Some(encoding)) if err.kind() == io::ErrorKind::NotFound => {
-                // Remove the extension corresponding to a precompressed file (.gz, .br, .zz)
-                // to reset the path before the next iteration.
-                path.set_extension(OsStr::new(""));
-                // Remove the encoding from the negotiated_encodings since the file doesn't exist
-                negotiated_encoding
-                    .retain(|(negotiated_encoding, _)| *negotiated_encoding != encoding);
+    let mut path_to_file = base_path.to_path_buf();
+    for component in path_decoded.components() {
+        match component {
+            Component::Normal(comp) => {
+                // protect against paths like `/foo/c:/bar/baz` (#204)
+                if Path::new(&comp)
+                    .components()
+                    .all(|c| matches!(c, Component::Normal(_)))
+                {
+                    path_to_file.push(comp)
+                } else {
+                    return None;
+                }
             }
-            (Err(err), _) => return Err(err),
-        }
-    };
-    Ok((file, encoding))
-}
-
-// Attempts to get the file metadata with any of the possible negotiated_encodings in the
-// preferred order. If none of the negotiated_encodings have a corresponding precompressed
-// file the uncompressed file is used as a fallback.
-async fn file_metadata_with_fallback(
-    mut path: PathBuf,
-    mut negotiated_encoding: Vec<(Encoding, QValue)>,
-) -> io::Result<(Metadata, Option<Encoding>)> {
-    let (file, encoding) = loop {
-        // Get the preferred encoding among the negotiated ones.
-        let encoding = preferred_encoding(&mut path, &negotiated_encoding);
-        match (tokio::fs::metadata(&path).await, encoding) {
-            (Ok(file), maybe_encoding) => break (file, maybe_encoding),
-            (Err(err), Some(encoding)) if err.kind() == io::ErrorKind::NotFound => {
-                // Remove the extension corresponding to a precompressed file (.gz, .br, .zz)
-                // to reset the path before the next iteration.
-                path.set_extension(OsStr::new(""));
-                // Remove the encoding from the negotiated_encodings since the file doesn't exist
-                negotiated_encoding
-                    .retain(|(negotiated_encoding, _)| *negotiated_encoding != encoding);
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                return None;
             }
-            (Err(err), _) => return Err(err),
         }
-    };
-    Ok((file, encoding))
-}
-
-fn try_parse_range(
-    maybe_range_ref: Option<&str>,
-    file_size: u64,
-) -> Option<Result<Vec<RangeInclusive<u64>>, RangeUnsatisfiableError>> {
-    maybe_range_ref.map(|header_value| {
-        http_range_header::parse_range_header(header_value)
-            .and_then(|first_pass| first_pass.validate(file_size))
-    })
+    }
+    Some(path_to_file)
 }

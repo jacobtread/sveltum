@@ -43,22 +43,13 @@ impl Encoding {
 
         None
     }
-
-    pub(crate) fn preferred_encoding(
-        accepted_encodings: impl Iterator<Item = (Encoding, QValue)>,
-    ) -> Option<Self> {
-        accepted_encodings
-            .filter(|(_, qvalue)| qvalue.0 > 0)
-            .max_by_key(|&(encoding, qvalue)| (qvalue, encoding))
-            .map(|(encoding, _)| encoding)
-    }
 }
 
 // Allowed q-values are numbers between 0 and 1 with at most 3 digits in the fractional part. They
 // are presented here as an unsigned integer between 0 and 1000.
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct QValue(u16);
+pub struct QValue(pub u16);
 
 impl QValue {
     #[inline]

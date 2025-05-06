@@ -1,6 +1,7 @@
 use http::header::HeaderValue;
+use http_range_header::RangeUnsatisfiableError;
 use httpdate::HttpDate;
-use std::time::SystemTime;
+use std::{ops::RangeInclusive, time::SystemTime};
 
 pub struct LastModified(pub HttpDate);
 
@@ -42,4 +43,14 @@ impl IfUnmodifiedSince {
             .and_then(|value| httpdate::parse_http_date(value).ok())
             .map(|time| IfUnmodifiedSince(time.into()))
     }
+}
+
+pub fn try_parse_range(
+    maybe_range_ref: Option<&str>,
+    file_size: u64,
+) -> Option<Result<Vec<RangeInclusive<u64>>, RangeUnsatisfiableError>> {
+    maybe_range_ref.map(|header_value| {
+        http_range_header::parse_range_header(header_value)
+            .and_then(|first_pass| first_pass.validate(file_size))
+    })
 }
