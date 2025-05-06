@@ -5,7 +5,7 @@ pub fn encodings(headers: &http::HeaderMap) -> impl Iterator<Item = (Encoding, Q
     headers
         .get_all(http::header::ACCEPT_ENCODING)
         .iter()
-        .filter_map(|hval| hval.to_str().ok())
+        .filter_map(|value| value.to_str().ok())
         .flat_map(|s| s.split(','))
         .filter_map(move |v| {
             let mut v = v.splitn(2, ';');
@@ -27,7 +27,7 @@ pub fn encodings(headers: &http::HeaderMap) -> impl Iterator<Item = (Encoding, Q
 
 // This enum's variants are ordered from least to most preferred.
 #[derive(Copy, Clone, Debug, Ord, PartialOrd, PartialEq, Eq)]
-pub(crate) enum Encoding {
+pub enum Encoding {
     #[allow(dead_code)]
     Identity,
     Gzip,

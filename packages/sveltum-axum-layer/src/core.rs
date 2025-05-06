@@ -52,7 +52,7 @@ pub struct ServeSvelteState {
     pub prerendered_path: PathBuf,
 }
 
-// Options extrected from a file request
+// Options extracted from a file request
 struct FileRequestOptions {
     if_unmodified_since: Option<IfUnmodifiedSince>,
     if_modified_since: Option<IfModifiedSince>,
