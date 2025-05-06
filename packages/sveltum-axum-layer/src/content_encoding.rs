@@ -8,7 +8,6 @@ pub(crate) enum Encoding {
 }
 
 impl Encoding {
-    #[allow(dead_code)]
     fn to_str(self) -> &'static str {
         match self {
             Encoding::Gzip => "gzip",
@@ -17,7 +16,7 @@ impl Encoding {
         }
     }
 
-    pub(crate) fn to_file_extension(self) -> Option<&'static std::ffi::OsStr> {
+    pub fn to_file_extension(self) -> Option<&'static std::ffi::OsStr> {
         match self {
             Encoding::Gzip => Some(std::ffi::OsStr::new(".gz")),
             Encoding::Brotli => Some(std::ffi::OsStr::new(".br")),
@@ -25,8 +24,7 @@ impl Encoding {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn into_header_value(self) -> http::HeaderValue {
+    pub fn into_header_value(self) -> http::HeaderValue {
         http::HeaderValue::from_static(self.to_str())
     }
 
